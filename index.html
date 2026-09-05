@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="用于小说、OC 与跑团的遗产继承情景计算器。" />
+    <title>遗产继承情景计算器</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2218%22 fill=%22%23275d4b%22/><text x=%2232%22 y=%2243%22 text-anchor=%22middle%22 font-size=%2236%22 fill=%22white%22>遗</text></svg>" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="遗产继承情景计算器首页">
+          <span class="brand-mark">遗</span>
+          <span><strong>遗产继承情景计算器</strong></span>
+        </a>
+        <div class="topbar-actions">
+          <span class="local-pill"><span class="local-dot"></span>仅保存在本机</span>
+          <button class="quiet-button" id="exportButton" type="button">导出项目</button>
+          <button class="quiet-button" id="importButton" type="button">导入</button>
+          <input id="importInput" type="file" accept="application/json" hidden />
+        </div>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="hero-copy">
+            <span class="eyebrow">小说 · OC · 跑团 · 情景模拟</span>
+            <h1>我什么时候能继承到<br /><em>百万遗产？</em></h1>
+          </div>
+          <aside class="safety-card">
+            <span class="safety-icon" aria-hidden="true">☂</span>
+            <div>
+              <strong>无不良引导，请勿伤害任何人</strong>
+              <p>本工具仅供娱乐，适用虚拟创作与情景模拟等虚构场景，不构成或提供法律建议，现实问题请咨询相关专业人士。</p>
+            </div>
+          </aside>
+        </section>
+
+        <section class="workspace" aria-label="继承情景工作台">
+          <div class="workspace-heading">
+            <div>
+              <span class="step-kicker">当前情景</span>
+              <h2 id="scenarioTitle">未命名情景</h2>
+            </div>
+            <div class="scenario-actions">
+              <span class="saved-state" id="savedState">已保存</span>
+              <button class="storm-mode-button" id="stormModeButton" type="button">暴风雪山庄模式</button>
+              <button class="secondary-button" id="resetButton" type="button">新建情景</button>
+            </div>
+          </div>
+
+          <div class="workspace-grid">
+            <aside class="setup-panel panel">
+              <div class="panel-header">
+                <span class="number-chip">01</span>
+                <div><h3>被继承人与遗产</h3><p>输入被继承人和净遗产金额。</p></div>
+              </div>
+
+              <label class="field-label" for="decedentName">被继承人</label>
+              <input class="text-input" id="decedentName" autocomplete="off" placeholder="角色姓名" />
+
+              <div class="field-label-row">
+                <label class="field-label" for="estateAmount">可供分配的净遗产</label>
+                <select class="currency-switch" id="currencySelect" aria-label="货币">
+                  <option value="CNY">¥ 人民币</option>
+                  <option value="USD">$ 美元</option>
+                  <option value="GBP">£ 英镑</option>
+                  <option value="EUR">€ 欧元</option>
+                  <option value="JPY">JP¥ 日元</option>
+                  <option value="KRW">₩ 韩元</option>
+                </select>
+              </div>
+              <div class="money-input-wrap">
+                <span id="estateCurrencySymbol">¥</span>
+                <input class="text-input money-input" id="estateAmount" inputmode="decimal" placeholder="0" />
+              </div>
+              <p class="field-help">请直接填写扣除共有财产、债务等之后，进入继承池的金额。</p>
+
+              <label class="field-label" for="lawPack">法律包</label>
+              <div class="select-wrap">
+                <select class="text-input" id="lawPack">
+                  <option value="cn-mainland-2021">中国大陆 · 现行 · 无遗嘱</option>
+                </select>
+              </div>
+              <div class="law-version">
+                <span class="flag-badge">CN</span>
+                <div><strong>《民法典》继承编</strong><small>2021-01-01 起施行 · 基础规则</small></div>
+              </div>
+
+              <div class="scope-note">
+                <strong>计算范围</strong>
+                <p>法定继承顺序、同顺序一般均分、子女支系代位、兄弟姐妹子女代位。</p>
+                <strong>暂未包含</strong>
+                <p>遗嘱、胎儿份额、份额调整、转继承、共有财产拆分、债务与税费。</p>
+              </div>
+            </aside>
+
+            <section class="people-panel panel">
+              <div class="panel-header people-header">
+                <div class="panel-header-left">
+                  <span class="number-chip">02</span>
+                  <div><h3>人物与关系</h3><p>添加人物并设置关系与状态。</p></div>
+                </div>
+                <div class="people-actions">
+                  <button class="secondary-button relation-tool-button" id="kinshipButton" type="button">亲戚关系计算器</button>
+                  <button class="primary-button" id="addPersonButton" type="button"><span>＋</span> 添加人物</button>
+                </div>
+              </div>
+
+              <div id="peopleList" class="people-list"></div>
+              <div id="emptyPeople" class="empty-state" hidden>
+                <div class="empty-illustration">◎</div>
+                <h4>还没有候选继承人</h4>
+                <p>从配偶、子女或父母开始录入，也可以直接载入示例看看。</p>
+                <button class="primary-button" type="button" data-action="add-person">添加第一个人物</button>
+              </div>
+            </section>
+
+            <aside class="results-panel panel" aria-live="polite">
+              <div class="panel-header">
+                <span class="number-chip coral">03</span>
+                <div><h3>分配结果</h3><p id="resultSubtitle">计算结果和适用规则</p></div>
+              </div>
+              <div id="results"></div>
+              <section class="reverse-panel">
+                <div class="reverse-heading">
+                  <span class="reverse-icon">↺</span>
+                  <div><h4>反向求解 <span class="reverse-quote">“到底要杀多少人，才能继承到遗产啊？”</span></h4><p>按目标金额查找需要调整的先亡状态。</p></div>
+                </div>
+                <label class="field-label" for="solverTarget">目标人物</label>
+                <select class="text-input" id="solverTarget"></select>
+                <label class="field-label" for="solverAmount">至少继承</label>
+                <div class="money-input-wrap">
+                  <span id="solverCurrencySymbol">¥</span>
+                  <input class="text-input money-input" id="solverAmount" inputmode="decimal" placeholder="输入目标金额" />
+                </div>
+                <button class="solver-button" id="solveButton" type="button">开始求解</button>
+                <div id="solverResults"></div>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+      </main>
+
+      <footer><span>遗产继承情景计算器</span><span>项目数据保存在本机</span></footer>
+    </div>
+
+    <dialog id="personDialog" class="person-dialog">
+      <form id="personForm" method="dialog">
+        <div class="dialog-header">
+          <div><span class="step-kicker">添加人物</span><h2>添加人物</h2></div>
+          <button class="icon-button dialog-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-label" for="personName">姓名</label>
+        <input class="text-input" id="personName" name="name" required maxlength="30" autocomplete="off" placeholder="例如：胡家侄子" />
+        <label class="field-label" for="personRelation">与被继承人的关系</label>
+        <select class="text-input" id="personRelation" name="relation" required></select>
+        <div id="parentField" hidden>
+          <label class="field-label" for="personParent">通过哪位人物建立代位支系</label>
+          <select class="text-input" id="personParent" name="parentId"></select>
+          <p class="field-help">子女的直系晚辈可以继续向下建立多代关系；兄弟姐妹支系在本法律包中仅覆盖其子女。</p>
+        </div>
+        <label class="field-label" for="personStatus">情景状态</label>
+        <select class="text-input" id="personStatus" name="status">
+          <option value="alive">生存</option>
+          <option value="predeceased">先于被继承人死亡</option>
+          <option value="renounced">放弃继承（按已生效处理）</option>
+          <option value="disqualified">丧失继承资格（按已确定处理）</option>
+        </select>
+        <div class="dialog-actions">
+          <button class="secondary-button dialog-close" type="button">取消</button>
+          <button class="primary-button" value="default">添加人物</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="kinshipDialog" class="person-dialog kinship-dialog">
+      <div class="kinship-content">
+        <div class="dialog-header">
+          <div><span class="step-kicker">称谓查询</span><h2>亲戚关系计算器</h2></div>
+          <button class="icon-button kinship-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="kinship-help">从“死者”开始，按顺序选择关系。</p>
+        <div class="kinship-path" id="kinshipPath">死者</div>
+        <div class="kinship-buttons">
+          <button type="button" data-kinship="father">父亲</button>
+          <button type="button" data-kinship="mother">母亲</button>
+          <button type="button" data-kinship="husband">丈夫</button>
+          <button type="button" data-kinship="wife">妻子</button>
+          <button type="button" data-kinship="older_brother">哥哥</button>
+          <button type="button" data-kinship="younger_brother">弟弟</button>
+          <button type="button" data-kinship="older_sister">姐姐</button>
+          <button type="button" data-kinship="younger_sister">妹妹</button>
+          <button type="button" data-kinship="son">儿子</button>
+          <button type="button" data-kinship="daughter">女儿</button>
+        </div>
+        <div class="kinship-result">
+          <div><span>亲戚称谓</span><strong id="kinshipResult">死者本人</strong></div>
+          <div><span id="kinshipCategoryLabel">人物分类</span><div class="kinship-category-value" id="kinshipCategory">被继承人</div></div>
+        </div>
+        <div class="dialog-actions">
+          <button class="secondary-button" id="kinshipUndo" type="button">退一步</button>
+          <button class="secondary-button" id="kinshipClear" type="button">清空</button>
+          <button class="primary-button kinship-close" type="button">完成</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="stormDialog" class="storm-dialog">
+      <div class="storm-content">
+        <div class="dialog-header storm-dialog-header">
+          <div>
+            <span class="step-kicker">事件顺序推理</span>
+            <h2>暴风雪山庄死到第三个人时的侦探会用到的奇妙小道具</h2>
+            <p>按顺序记录人物状态变化，查看每一步的继承份额变化与最大受益者。</p>
+          </div>
+          <button class="icon-button storm-close" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <div class="storm-grid">
+          <section class="storm-editor">
+            <h3>事件顺序</h3>
+            <div class="storm-add-row">
+              <select class="text-input" id="stormPerson"></select>
+              <select class="text-input" id="stormEventType">
+                <option value="death">死亡</option>
+                <option value="disqualified">丧失继承权</option>
+                <option value="renounced">放弃继承权</option>
+              </select>
+              <button class="primary-button" id="addStormEvent" type="button">加入顺序</button>
+            </div>
+            <p class="storm-method">死亡事件按“先于被继承人死亡”状态计算。</p>
+            <div class="storm-sequence" id="stormSequence"></div>
+            <button class="storm-analyze-button" id="analyzeStorm" type="button">开始推测最大受益者</button>
+          </section>
+
+          <section class="storm-analysis">
+            <h3>推测结果</h3>
+            <div id="stormResults" class="storm-results-empty">添加事件后开始推测。</div>
+          </section>
+        </div>
+      </div>
+    </dialog>
+
+    <template id="personCardTemplate">
+      <article class="person-card">
+        <div class="person-main">
+          <span class="avatar"></span>
+          <div class="person-identity"><strong></strong><span></span></div>
+        </div>
+        <div class="person-controls">
+          <label><span class="sr-only">人物状态</span><select class="status-select"></select></label>
+          <button class="icon-button delete-person" type="button" aria-label="删除人物">×</button>
+        </div>
+      </article>
+    </template>
+
+    <script defer src="./bundle.js"></script>
+  </body>
+</html>
