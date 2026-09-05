@@ -4,6 +4,8 @@
 
 本项目的程序代码由 AI 生成；产品构思、界面文案、调试与发布由本人完成。
 
+[![Ko-fi Support](https://img.shields.io/badge/Ko--fi-Support-555?logo=ko-fi&logoColor=white)](https://ko-fi.com/tupetetodou)
+
 当前内置法律包：**中国大陆现行法 · 无遗嘱继承基础规则**。
 
 ![主界面](preview.png)
@@ -147,3 +149,10 @@ inheritance-simulator/
 ```
 
 法律规则与通用计算引擎分离。新增司法辖区或历史版本时，可以增加独立 law pack，并在应用中注册相应模块。
+
+## Ko-fi
+
+如果这个工具对你有帮助，可以在 [Ko-fi](https://ko-fi.com/tupetetodou) 支持我的项目。
+我也在那里发布和出售手作海豹骰子。
+
+[![Ko-fi Support](https://img.shields.io/badge/Ko--fi-Support-555?logo=ko-fi&logoColor=white)](https://ko-fi.com/tupetetodou)
