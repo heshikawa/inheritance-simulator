@@ -7,8 +7,22 @@
     <title>遗产继承情景计算器</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><rect width=%2264%22 height=%2264%22 rx=%2218%22 fill=%22%23275d4b%22/><text x=%2232%22 y=%2243%22 text-anchor=%22middle%22 font-size=%2236%22 fill=%22white%22>遗</text></svg>" />
     <link rel="stylesheet" href="./styles.css" />
-    <script data-goatcounter="https://tupetetodou.goatcounter.com/count"
-            async src="//gc.zgo.at/count.js"></script>
+    <script>
+      (() => {
+        const localHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+        const isOnline =
+          (location.protocol === "https:" || location.protocol === "http:") &&
+          !localHosts.has(location.hostname);
+
+        if (!isOnline) return;
+
+        const script = document.createElement("script");
+        script.dataset.goatcounter = "https://tupetetodou.goatcounter.com/count";
+        script.async = true;
+        script.src = "https://gc.zgo.at/count.js";
+        document.head.appendChild(script);
+      })();
+    </script>
   </head>
   <body>
     <div class="page-shell">
@@ -63,39 +77,63 @@
               <label class="field-label" for="decedentName">被继承人</label>
               <input class="text-input" id="decedentName" autocomplete="off" placeholder="角色姓名" />
 
-              <div class="field-label-row">
-                <label class="field-label" for="estateAmount">可供分配的净遗产</label>
-                <select class="currency-switch" id="currencySelect" aria-label="货币">
-                  <option value="CNY">¥ 人民币</option>
-                  <option value="USD">$ 美元</option>
-                  <option value="GBP">£ 英镑</option>
-                  <option value="EUR">€ 欧元</option>
-                  <option value="JPY">JP¥ 日元</option>
-                  <option value="KRW">₩ 韩元</option>
-                </select>
-              </div>
-              <div class="money-input-wrap">
-                <span id="estateCurrencySymbol">¥</span>
-                <input class="text-input money-input" id="estateAmount" inputmode="decimal" placeholder="0" />
-              </div>
-              <p class="field-help">请直接填写扣除共有财产、债务等之后，进入继承池的金额。</p>
+              <label class="field-label compact-label" for="decedentSex">死者性别</label>
+              <select class="text-input" id="decedentSex">
+                <option value="male">男性</option>
+                <option value="female">女性</option>
+              </select>
 
-              <label class="field-label" for="lawPack">法律包</label>
-              <div class="select-wrap">
-                <select class="text-input" id="lawPack">
-                  <option value="cn-mainland-2021">中国大陆 · 现行 · 无遗嘱</option>
-                </select>
+              <div class="field-label-row">
+                <span class="field-label">遗产录入</span>
+                <label class="mode-toggle"><input id="detailedEstateToggle" type="checkbox" /><span>区分财产类型</span></label>
               </div>
+              <div id="simpleEstate">
+                <div class="field-label-row estate-label-row">
+                  <label class="field-label" for="estateAmount">可供分配的净遗产</label>
+                  <select class="currency-switch" id="currencySelect" aria-label="货币">
+                    <option value="CNY">¥ 人民币</option>
+                    <option value="TWD">NT$ 新台币</option>
+                    <option value="HKD">HK$ 港币</option>
+                    <option value="MOP">MOP$ 澳门元</option>
+                    <option value="USD">$ 美元</option>
+                    <option value="GBP">£ 英镑</option>
+                    <option value="EUR">€ 欧元</option>
+                    <option value="JPY">JP¥ 日元</option>
+                    <option value="KRW">₩ 韩元</option>
+                  </select>
+                </div>
+                <div class="money-input-wrap">
+                  <span id="estateCurrencySymbol">¥</span>
+                  <input class="text-input money-input" id="estateAmount" inputmode="decimal" placeholder="0" />
+                </div>
+                <p class="field-help">省略模式：直接填写清算后进入继承池的净额；法律包会显示采用的额外假设。</p>
+              </div>
+
+              <div id="detailedEstate" class="detailed-estate" hidden>
+                <div class="detailed-head"><span>勾选需要的财产池</span><select class="currency-switch" id="detailedCurrencySelect" aria-label="货币"></select></div>
+                <div class="asset-row" data-asset-key="personalChattels"><input class="asset-enabled" type="checkbox" aria-label="启用个人生活动产" /><span><b>个人生活动产</b><small>家具、衣物、车辆；香港法律包单列</small></span><input class="asset-amount" inputmode="decimal" aria-label="个人生活动产金额" placeholder="0" /></div>
+                <div class="asset-row" data-asset-key="personalMovable"><input class="asset-enabled" type="checkbox" aria-label="启用个人其他动产" /><span><b>个人其他动产</b><small>现金、证券、物品</small></span><input class="asset-amount" inputmode="decimal" aria-label="个人其他动产金额" placeholder="0" /></div>
+                <div class="asset-row" data-asset-key="personalImmovable"><input class="asset-enabled" type="checkbox" aria-label="启用个人不动产" /><span><b>个人不动产</b><small>土地、房屋、庄园</small></span><input class="asset-amount" inputmode="decimal" aria-label="个人不动产金额" placeholder="0" /></div>
+                <div class="asset-row" data-asset-key="communityMovable"><input class="asset-enabled" type="checkbox" aria-label="启用共同财产动产" /><span><b>共同财产·动产</b><small>填写共同财产总值</small></span><input class="asset-amount" inputmode="decimal" aria-label="共同财产动产总值" placeholder="0" /></div>
+                <div class="asset-row" data-asset-key="communityImmovable"><input class="asset-enabled" type="checkbox" aria-label="启用共同财产不动产" /><span><b>共同财产·不动产</b><small>填写共同财产总值</small></span><input class="asset-amount" inputmode="decimal" aria-label="共同财产不动产总值" placeholder="0" /></div>
+                <div class="community-share"><label for="communitySharePercent">死者占共同财产</label><div><input id="communitySharePercent" type="number" min="0" max="100" step="1" value="50" /><span>%</span></div></div>
+                <div class="detailed-total"><span>进入遗产的合计</span><strong id="detailedEstateTotal">¥0.00</strong></div>
+              </div>
+
+              <label class="field-label" for="countrySelect">国家／法域</label>
+              <select class="text-input" id="countrySelect"><option value="china">中国</option></select>
+              <label class="field-label compact-label" for="lawPack">法律版本／州</label>
+              <div class="select-wrap"><select class="text-input" id="lawPack"><option value="cn-mainland-2021">中国大陆｜2021—现行</option></select></div>
               <div class="law-version">
-                <span class="flag-badge">CN</span>
-                <div><strong>《民法典》继承编</strong><small>2021-01-01 起施行 · 基础规则</small></div>
+                <span class="flag-badge" id="lawFlag">CN</span>
+                <div><strong id="lawTitle">《民法典》继承编</strong><small id="lawEffective">2021-01-01 起 · 现行核心规则</small></div>
               </div>
 
               <div class="scope-note">
                 <strong>计算范围</strong>
-                <p>法定继承顺序、同顺序一般均分、子女支系代位、兄弟姐妹子女代位。</p>
+                <p id="lawScope">法定继承顺序、同顺序一般均分、子女支系代位、兄弟姐妹子女代位。</p>
                 <strong>暂未包含</strong>
-                <p>遗嘱、胎儿份额、份额调整、转继承、共有财产拆分、债务与税费。</p>
+                <p id="lawOmissions">遗嘱、胎儿份额、份额调整、转继承、债务与税费。</p>
               </div>
             </aside>
 
@@ -147,7 +185,7 @@
 
       </main>
 
-      <footer><span>遗产继承情景计算器</span><span>项目数据保存在本机</span></footer>
+      <footer><span>遗产继承情景计算器</span><span class="footer-credit">© tupetetodou</span><span>项目数据保存在本机</span></footer>
     </div>
 
     <dialog id="personDialog" class="person-dialog">
@@ -161,9 +199,9 @@
         <label class="field-label" for="personRelation">与被继承人的关系</label>
         <select class="text-input" id="personRelation" name="relation" required></select>
         <div id="parentField" hidden>
-          <label class="field-label" for="personParent">通过哪位人物建立代位支系</label>
+          <label class="field-label" id="parentFieldLabel" for="personParent">通过哪位人物建立代位支系</label>
           <select class="text-input" id="personParent" name="parentId"></select>
-          <p class="field-help">子女的直系晚辈可以继续向下建立多代关系；兄弟姐妹支系在本法律包中仅覆盖其子女。</p>
+          <p class="field-help" id="parentHelp">是否允许继续代位／代表由当前法律包决定。</p>
         </div>
         <label class="field-label" for="personStatus">情景状态</label>
         <select class="text-input" id="personStatus" name="status">
@@ -172,6 +210,7 @@
           <option value="renounced">放弃继承（按已生效处理）</option>
           <option value="disqualified">丧失继承资格（按已确定处理）</option>
         </select>
+        <div id="personDynamicFields" class="dynamic-fields" hidden></div>
         <div class="dialog-actions">
           <button class="secondary-button dialog-close" type="button">取消</button>
           <button class="primary-button" value="default">添加人物</button>
@@ -185,20 +224,9 @@
           <div><span class="step-kicker">称谓查询</span><h2>亲戚关系计算器</h2></div>
           <button class="icon-button kinship-close" type="button" aria-label="关闭">×</button>
         </div>
-        <p class="kinship-help">从“死者”开始，按顺序选择关系。</p>
+        <p class="kinship-help">从“死者”开始，按顺序选择关系。当前联动：<b id="kinshipLaw">中国大陆｜2021—现行</b></p>
         <div class="kinship-path" id="kinshipPath">死者</div>
-        <div class="kinship-buttons">
-          <button type="button" data-kinship="father">父亲</button>
-          <button type="button" data-kinship="mother">母亲</button>
-          <button type="button" data-kinship="husband">丈夫</button>
-          <button type="button" data-kinship="wife">妻子</button>
-          <button type="button" data-kinship="older_brother">哥哥</button>
-          <button type="button" data-kinship="younger_brother">弟弟</button>
-          <button type="button" data-kinship="older_sister">姐姐</button>
-          <button type="button" data-kinship="younger_sister">妹妹</button>
-          <button type="button" data-kinship="son">儿子</button>
-          <button type="button" data-kinship="daughter">女儿</button>
-        </div>
+        <div class="kinship-buttons" id="kinshipButtons"></div>
         <div class="kinship-result">
           <div><span>亲戚称谓</span><strong id="kinshipResult">死者本人</strong></div>
           <div><span id="kinshipCategoryLabel">人物分类</span><div class="kinship-category-value" id="kinshipCategory">被继承人</div></div>
@@ -251,7 +279,7 @@
       <article class="person-card">
         <div class="person-main">
           <span class="avatar"></span>
-          <div class="person-identity"><strong></strong><span></span></div>
+          <div class="person-identity"><strong></strong><span class="person-relation"></span><span class="attribute-badges"></span></div>
         </div>
         <div class="person-controls">
           <label><span class="sr-only">人物状态</span><select class="status-select"></select></label>

@@ -6,7 +6,9 @@ const stripModules = (source) => source
 
 const files = [
   './src/engine.js',
+  './src/people.js',
   './src/law-packs/cn-mainland-2021.js',
+  './src/law-packs/catalog.js',
   './src/solver.js',
   './src/storm-solver.js',
   './src/app.js'

@@ -18,6 +18,146 @@ const multiplyFraction = (value, n, d = 1) => fraction(value.n * n, value.d * d)
 const addFraction = (left, right) =>
   fraction(left.n * right.d + right.n * left.d, left.d * right.d);
 
+const finiteAmount = (value) => {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+};
+
+const assetAmount = (assets, key) => {
+  const asset = assets?.[key];
+  if (!asset || asset.enabled === false) return 0;
+  return finiteAmount(asset.amount);
+};
+
+/**
+ * Converts either the compact net-estate entry or the optional property
+ * worksheet into the pools used by law packs. Community-property entries are
+ * gross values; only the deceased's configured share enters the estate.
+ */
+function normalizeEstate(caseData = {}) {
+  const mode = caseData.estateMode === 'detailed' ? 'detailed' : 'simple';
+  if (mode === 'simple') {
+    const raw = Number(caseData.decedent?.estate ?? 0);
+    const valid = Number.isFinite(raw) && raw >= 0;
+    const total = valid ? raw : 0;
+    return {
+      mode,
+      valid,
+      total,
+      communitySharePercent: 50,
+      pools: {
+        chattels: 0,
+        personalMovable: total,
+        personalImmovable: 0,
+        communityMovable: 0,
+        communityImmovable: 0,
+        personalty: total,
+        movable: total,
+        immovable: 0,
+        separate: total,
+        community: 0
+      }
+    };
+  }
+
+  const assets = caseData.assets || {};
+  const rawShare = Number(caseData.communitySharePercent ?? 50);
+  const sharePercent = Number.isFinite(rawShare) ? Math.min(100, Math.max(0, rawShare)) : 50;
+  const share = sharePercent / 100;
+  const chattels = assetAmount(assets, 'personalChattels');
+  const personalMovable = assetAmount(assets, 'personalMovable');
+  const personalImmovable = assetAmount(assets, 'personalImmovable');
+  const communityMovable = assetAmount(assets, 'communityMovable') * share;
+  const communityImmovable = assetAmount(assets, 'communityImmovable') * share;
+  const personalty = chattels + personalMovable + communityMovable;
+  const immovable = personalImmovable + communityImmovable;
+  const total = personalty + immovable;
+  return {
+    mode,
+    valid: true,
+    total,
+    communitySharePercent: sharePercent,
+    pools: {
+      chattels,
+      personalMovable,
+      personalImmovable,
+      communityMovable,
+      communityImmovable,
+      personalty,
+      movable: personalty,
+      immovable,
+      separate: chattels + personalMovable + personalImmovable,
+      community: communityMovable + communityImmovable
+    }
+  };
+}
+
+const approximateFraction = (amount, total) => {
+  if (!total) return fraction(0, 1);
+  return fraction(Math.round(amount / total * 1_000_000), 1_000_000);
+};
+
+function customResult(calculation, context, lawPack) {
+  const inherited = new Map();
+  (calculation.allocations || []).forEach((allocation) => {
+    const person = allocation.person || context.people.find((candidate) => candidate.id === allocation.personId);
+    const amount = finiteAmount(allocation.amount);
+    if (!person || amount <= 0) return;
+    const previous = inherited.get(person.id) || {
+      person,
+      amount: 0,
+      routes: [],
+      breakdown: []
+    };
+    previous.amount += amount;
+    previous.routes.push(allocation);
+    if (allocation.breakdown) previous.breakdown.push(allocation.breakdown);
+    inherited.set(person.id, previous);
+  });
+
+  const heirs = [...inherited.values()]
+    .map((entry) => {
+      const primary = entry.routes[0];
+      return {
+        personId: entry.person.id,
+        name: entry.person.name,
+        relation: entry.person.relation,
+        amount: entry.amount,
+        share: primary.share || approximateFraction(entry.amount, context.estate),
+        shareLabel: primary.shareLabel || null,
+        route: primary.route || 'direct',
+        representedName: primary.representedName || null,
+        breakdown: entry.breakdown
+      };
+    })
+    .sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name, 'zh-CN'));
+
+  const warnings = [
+    ...(calculation.warnings || []),
+    ...(lawPack.getWarnings?.(context) || [])
+  ];
+  const allocatedTotal = heirs.reduce((sum, heir) => sum + heir.amount, 0);
+  const unallocatedAmount = Math.max(0, context.estate - allocatedTotal);
+  if (unallocatedAmount > Math.max(0.01, context.estate * 1e-10)) {
+    warnings.push(`当前录入人物不足以承接全部所有权，尚有 ${unallocatedAmount.toFixed(2)} 未分配。`);
+  }
+  return {
+    order: calculation.order ?? null,
+    orderLabel: calculation.orderLabel || null,
+    summary: calculation.summary || null,
+    heirs,
+    branches: calculation.branches || [],
+    excluded: calculation.excluded || [],
+    basis: calculation.basis || lawPack.getBasis?.({ ...context, order: calculation.order, branches: calculation.branches || [] }) || [],
+    warnings: [...new Set(warnings)],
+    specialInterests: calculation.specialInterests || [],
+    unallocatedAmount,
+    estate: context.estate,
+    estateBreakdown: context.estateData,
+    lawPack: lawPack.meta
+  };
+}
+
 const isEligible = (person) => person.status === 'alive';
 const isPredeceased = (person) => person.status === 'predeceased';
 
@@ -27,12 +167,12 @@ const isPredeceased = (person) => person.status === 'predeceased';
  * either piece without coupling rules to UI code.
  */
 function calculateInheritance(caseData, lawPack) {
-  const estate = Number(caseData.decedent?.estate ?? 0);
+  const estateData = normalizeEstate(caseData);
+  const estate = estateData.total;
   const people = Array.isArray(caseData.people) ? caseData.people : [];
-  const context = { caseData, people, estate, helpers: { isEligible, isPredeceased } };
-  const determination = lawPack.determineOrder(context);
+  const context = { caseData, people, estate, estateData, pools: estateData.pools, helpers: { isEligible, isPredeceased } };
 
-  if (!Number.isFinite(estate) || estate < 0) {
+  if (!estateData.valid) {
     return {
       order: null,
       heirs: [],
@@ -41,9 +181,17 @@ function calculateInheritance(caseData, lawPack) {
       basis: [],
       warnings: ['净遗产必须是大于或等于 0 的数字。'],
       estate: 0,
+      estateBreakdown: estateData,
+      specialInterests: [],
       lawPack: lawPack.meta
     };
   }
+
+  if (typeof lawPack.calculate === 'function') {
+    return customResult(lawPack.calculate(context) || {}, context, lawPack);
+  }
+
+  const determination = lawPack.determineOrder(context);
 
   if (!determination.branches.length) {
     return {
@@ -54,6 +202,8 @@ function calculateInheritance(caseData, lawPack) {
       basis: lawPack.getBasis({ ...context, order: null, branches: [] }),
       warnings: ['当前录入范围内没有可参与分配的继承人。'],
       estate,
+      estateBreakdown: estateData,
+      specialInterests: [],
       lawPack: lawPack.meta
     };
   }
@@ -97,11 +247,40 @@ function calculateInheritance(caseData, lawPack) {
     basis: lawPack.getBasis({ ...context, order: determination.order, branches: branchResults }),
     warnings: lawPack.getWarnings?.(context) || [],
     estate,
+    estateBreakdown: estateData,
+    specialInterests: [],
     lawPack: lawPack.meta
   };
 }
 
-const formatFraction = ({ n, d }) => n === d ? '全部' : `${n}/${d}`;
+const formatFraction = ({ n, d } = { n: 0, d: 1 }) => n === d ? '全部' : `${n}/${d}`;
+
+
+function normalizePersonName(value = '') {
+  return String(value)
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s+/gu, ' ')
+    .toLocaleLowerCase();
+}
+
+function findPersonNameConflict(people = [], name = '', ignoreId = null) {
+  const normalized = normalizePersonName(name);
+  if (!normalized) return null;
+  return people.find((person) => (
+    person?.id !== ignoreId && normalizePersonName(person?.name) === normalized
+  )) || null;
+}
+
+function findDuplicatePersonName(people = []) {
+  const seen = [];
+  for (const person of people) {
+    const conflict = findPersonNameConflict(seen, person?.name);
+    if (conflict) return { first: conflict, duplicate: person };
+    seen.push(person);
+  }
+  return null;
+}
 
 
 
@@ -256,10 +435,10 @@ function buildSecondOrder(people) {
 const cnMainland2021 = {
   meta: {
     id: 'cn-mainland-2021',
-    name: '中国大陆｜现行',
+    name: '中国大陆｜2021—现行',
     jurisdiction: '中国大陆',
     effectiveFrom: '2021-01-01',
-    mode: '无遗嘱继承 · 基础规则',
+    mode: '无遗嘱继承 · 核心情景',
     version: '0.1.0'
   },
   relationLabels,
@@ -326,6 +505,1685 @@ const cnMainland2021 = {
     return warnings;
   }
 };
+
+
+
+/*
+ * Law-pack catalog for fiction and tabletop scenarios. Historical packs are
+ * deliberately labelled as representative models; their assumptions are part
+ * of the UI instead of being hidden in the arithmetic.
+ */
+
+const lpStatusLabels = {
+  alive: '生存',
+  predeceased: '先于被继承人死亡',
+  renounced: '放弃继承',
+  disqualified: '丧失继承资格'
+};
+
+const lpRelationLabels = {
+  spouse: '配偶',
+  child: '子女',
+  parent: '父母',
+  descendant: '子女的直系晚辈',
+  sibling: '兄弟姐妹',
+  sibling_child: '兄弟姐妹的后代',
+  paternal_grandparent: '祖父母',
+  maternal_grandparent: '外祖父母',
+  uncle_aunt: '伯叔姑舅姨',
+  uncle_aunt_child: '伯叔姑舅姨的后代',
+  other_collateral: '其他旁系亲属',
+  de_facto_partner: '事实婚伴侣',
+  stepchild: '继子女',
+  house_member: '家中其他成员',
+  concubine: '侧室／妾'
+};
+
+const lpRelationsBase = [
+  'spouse', 'child', 'descendant', 'parent', 'sibling', 'sibling_child',
+  'paternal_grandparent', 'maternal_grandparent'
+];
+const lpRelationsExtended = [...lpRelationsBase, 'uncle_aunt', 'uncle_aunt_child', 'other_collateral'];
+
+const lpGroupsChinaMainland = [
+  { title: '第一顺序', relations: ['spouse', 'child', 'parent'] },
+  { title: '子女支系 · 代位候选', relations: ['descendant'] },
+  { title: '第二顺序', relations: ['sibling', 'paternal_grandparent', 'maternal_grandparent'] },
+  { title: '兄弟姐妹支系 · 代位候选', relations: ['sibling_child'] }
+];
+const lpGroupsTaiwan = [
+  { title: '配偶 · 随血亲顺序共同继承', relations: ['spouse'] },
+  { title: '第一顺序 · 直系血亲卑亲属', relations: ['child', 'descendant'] },
+  { title: '第二顺序 · 父母', relations: ['parent'] },
+  { title: '第三顺序 · 兄弟姐妹', relations: ['sibling'] },
+  { title: '第四顺序 · 祖父母', relations: ['paternal_grandparent', 'maternal_grandparent'] },
+  { title: '无法定继承权 · 兄弟姐妹后代', relations: ['sibling_child'] }
+];
+const lpGroupsHongKong = [
+  { title: '生存配偶', relations: ['spouse'] },
+  { title: '后嗣', relations: ['child', 'descendant'] },
+  { title: '父母', relations: ['parent'] },
+  { title: '全血／半血兄弟姐妹支系 · 分别排序', relations: ['sibling', 'sibling_child'] },
+  { title: '祖父母', relations: ['paternal_grandparent', 'maternal_grandparent'] },
+  { title: '全血／半血伯叔姑舅姨支系 · 分别排序', relations: ['uncle_aunt', 'uncle_aunt_child'] },
+  { title: '无法定继承权 · 其余旁系亲属', relations: ['other_collateral'] }
+];
+const lpGroupsMacau = [
+  { title: '配偶 · 第一至第三顺序', relations: ['spouse'] },
+  { title: '第一顺序 · 直系血亲卑亲属', relations: ['child', 'descendant'] },
+  { title: '第二顺序 · 直系血亲尊亲属', relations: ['parent', 'paternal_grandparent', 'maternal_grandparent'] },
+  { title: '第四顺序 · 合资格事实婚伴侣', relations: ['de_facto_partner'] },
+  { title: '第五顺序 · 兄弟姐妹及其后代', relations: ['sibling', 'sibling_child'] },
+  { title: '第六顺序 · 四亲等内其他旁系亲属', relations: ['uncle_aunt', 'uncle_aunt_child', 'other_collateral'] }
+];
+const lpGroupsJapanModern = [
+  { title: '配偶 · 常为继承人', relations: ['spouse'] },
+  { title: '第一順位 · 子女及代襲后代', relations: ['child', 'descendant'] },
+  { title: '第二順位 · 最近直系尊属', relations: ['parent', 'paternal_grandparent', 'maternal_grandparent'] },
+  { title: '第三順位 · 兄弟姐妹及代襲后代', relations: ['sibling', 'sibling_child'] }
+];
+const lpGroupsJapanHouse = [
+  { title: '直系卑属候选', relations: ['child', 'descendant'] },
+  { title: '家成员候选', relations: ['house_member'] },
+  { title: '直系尊属候选', relations: ['parent', 'paternal_grandparent', 'maternal_grandparent'] },
+  { title: '旁系家族候选', relations: ['sibling', 'sibling_child'] },
+  { title: '无当然承继权', relations: ['spouse', 'concubine'] }
+];
+const lpGroupsUnitedStates = [
+  { title: '生存配偶', relations: ['spouse'] },
+  { title: '后代支系', relations: ['child', 'descendant'] },
+  { title: '父母', relations: ['parent'] },
+  { title: '父母的后代', relations: ['sibling', 'sibling_child'] },
+  { title: '祖父母、祖父母的后代及其他后位血亲', relations: ['paternal_grandparent', 'maternal_grandparent', 'uncle_aunt', 'uncle_aunt_child', 'other_collateral'] },
+  { title: '继子女 · 按州法另行判断', relations: ['stepchild'] }
+];
+const lpGroupsConnecticut = [
+  ...lpGroupsUnitedStates.slice(0, -1),
+  { title: '无近亲时 · 继子女', relations: ['stepchild'] }
+];
+const lpGroupsVictorian = [
+  { title: '遗孀／鳏夫', relations: ['spouse'] },
+  { title: '后代 · 动产与不动产路线不同', relations: ['child', 'descendant'] },
+  { title: '父母', relations: ['parent'] },
+  { title: '兄弟姐妹支系', relations: ['sibling', 'sibling_child'] },
+  { title: '祖父母及较远旁系', relations: ['paternal_grandparent', 'maternal_grandparent', 'uncle_aunt', 'uncle_aunt_child', 'other_collateral'] }
+];
+
+const lpFemaleField = {
+  key: 'isFemale', type: 'checkbox', label: '女性', badge: '女性',
+  help: '未勾选任何人物时不区分性别；勾选后按当前法律包的女性继承规则处理。',
+  relations: ['child', 'descendant', 'parent', 'sibling', 'sibling_child', 'paternal_grandparent', 'maternal_grandparent', 'house_member']
+};
+const lpBirthOrderField = {
+  key: 'birthOrder', type: 'number', label: '出生／排行顺序', badge: '排行', min: 1,
+  help: '不同性别合并排序，同一组不得重复。',
+  relations: ['child', 'descendant', 'sibling', 'sibling_child', 'house_member']
+};
+const lpNonmaritalField = {
+  key: 'isNonmarital', type: 'checkbox', label: '非婚生子女', badge: '非婚生',
+  relations: ['child', 'descendant']
+};
+const lpAdoptedField = {
+  key: 'isAdopted', type: 'checkbox', label: '养子女／收养后代', badge: '收养',
+  relations: ['child', 'descendant']
+};
+const lpDesignatedField = {
+  key: 'designatedHouseHeir', type: 'checkbox', label: '已指定为家督／家产承继人', badge: '指定承继人',
+  relations: ['child', 'descendant', 'sibling', 'sibling_child', 'house_member']
+};
+const lpSharedChildField = {
+  key: 'sharedWithSpouse', type: 'checkbox', label: '与当前生存配偶的共同子女', badge: '共同子女',
+  relations: ['child']
+};
+const lpOtherDescField = {
+  key: 'hasOtherDescendants', type: 'checkbox', label: '配偶另有非死者的后代', badge: '另有后代',
+  relations: ['spouse']
+};
+const lpHalfBloodField = {
+  key: 'halfBlood', type: 'checkbox', label: '半血缘（同父异母／同母异父）', badge: '半血缘',
+  relations: ['sibling', 'sibling_child', 'uncle_aunt', 'uncle_aunt_child']
+};
+const lpDeFactoField = {
+  key: 'qualifiedDeFacto', type: 'checkbox', label: '符合四年以上事实婚条件', badge: '合资格事实婚',
+  relations: ['de_facto_partner']
+};
+
+function lpBirthOrderGroup(person) {
+  if (['child', 'sibling', 'house_member'].includes(person?.relation)) return person.relation;
+  if (['descendant', 'sibling_child'].includes(person?.relation)) return `${person.relation}:${person.parentId || ''}`;
+  return null;
+}
+
+function findBirthOrderConflict(people, candidate) {
+  const order = candidate?.attributes?.birthOrder;
+  const group = lpBirthOrderGroup(candidate);
+  if (!group || !Number.isInteger(order) || order < 1) return null;
+  return people.find((person) => lpBirthOrderGroup(person) === group && person.attributes?.birthOrder === order) || null;
+}
+
+const lpAlive = (person) => person?.status === 'alive';
+const lpPredeceased = (person) => person?.status === 'predeceased';
+const lpAttribute = (person, key) => person?.attributes?.[key];
+const lpDecedentSex = (context) => context.caseData?.decedent?.sex === 'female' ? 'female' : 'male';
+const lpLiving = (people, relations) => people.filter((person) => relations.includes(person.relation) && lpAlive(person));
+const lpFirstSpouse = (people) => people.find((person) => person.relation === 'spouse' && lpAlive(person));
+
+function lpChildRecipients(people, parent, childRelation, maxDepth, depth = 1) {
+  if (depth > maxDepth) return [];
+  const children = people.filter((person) => person.relation === childRelation && person.parentId === parent.id);
+  const viable = children.map((person) => {
+    if (lpAlive(person)) return { person, nested: null };
+    if (lpPredeceased(person)) {
+      const nested = lpChildRecipients(people, person, childRelation, maxDepth, depth + 1);
+      if (nested.length) return { person, nested };
+    }
+    return null;
+  }).filter(Boolean);
+  if (!viable.length) return [];
+  return viable.flatMap((entry) => {
+    if (!entry.nested) {
+      return [{ person: entry.person, fraction: 1 / viable.length, route: 'representation', representedName: parent.name }];
+    }
+    return entry.nested.map((recipient) => ({
+      ...recipient,
+      fraction: recipient.fraction / viable.length,
+      representedName: parent.name
+    }));
+  });
+}
+
+function lpBuildBranches(people, rootRelation, childRelation, options = {}) {
+  const maxDepth = options.maxDepth ?? Number.POSITIVE_INFINITY;
+  const roots = people.filter((person) => person.relation === rootRelation && (!options.rootFilter || options.rootFilter(person)));
+  return roots.map((root) => {
+    if (lpAlive(root)) {
+      return {
+        key: root.id,
+        label: root.name,
+        root,
+        weight: options.weight?.(root) ?? 1,
+        recipients: [{ person: root, fraction: 1, route: 'direct' }]
+      };
+    }
+    if (lpPredeceased(root)) {
+      const recipients = lpChildRecipients(people, root, childRelation, maxDepth);
+      if (recipients.length) {
+        return {
+          key: `branch-${root.id}`,
+          label: `${root.name}支系`,
+          root,
+          weight: options.weight?.(root) ?? 1,
+          recipients
+        };
+      }
+    }
+    return null;
+  }).filter(Boolean);
+}
+
+const lpDescendantBranches = (people, options = {}) => lpBuildBranches(people, 'child', 'descendant', options);
+const lpSiblingBranches = (people, options = {}) => lpBuildBranches(people, 'sibling', 'sibling_child', options);
+
+function lpPeopleBranches(people, relations, options = {}) {
+  return lpLiving(people, relations)
+    .filter((person) => !options.filter || options.filter(person))
+    .map((person) => ({
+      key: person.id,
+      label: person.name,
+      root: person,
+      weight: options.weight?.(person) ?? 1,
+      recipients: [{ person, fraction: 1, route: 'direct' }]
+    }));
+}
+
+function lpAddAllocation(allocations, person, amount, details = {}) {
+  if (!person || !Number.isFinite(amount) || amount <= 0) return;
+  allocations.push({ person, amount, route: 'direct', ...details });
+}
+
+function lpAllocateBranches(allocations, branches, amount, breakdown) {
+  const totalWeight = branches.reduce((sum, branch) => sum + Math.max(0, branch.weight ?? 1), 0);
+  if (!amount || !totalWeight) return;
+  branches.forEach((branch) => {
+    const branchAmount = amount * Math.max(0, branch.weight ?? 1) / totalWeight;
+    branch.recipients.forEach((recipient) => lpAddAllocation(
+      allocations,
+      recipient.person,
+      branchAmount * recipient.fraction,
+      {
+        route: recipient.route,
+        representedName: recipient.representedName,
+        breakdown
+      }
+    ));
+  });
+}
+
+function lpAllocateFamily(allocations, family, amount, breakdown, splitGrandparents = false) {
+  if (!family || !amount) return;
+  if (splitGrandparents && family.order === 4) {
+    const paternal = family.branches.filter((branch) => branch.root?.relation === 'paternal_grandparent');
+    const maternal = family.branches.filter((branch) => branch.root?.relation === 'maternal_grandparent');
+    if (paternal.length && maternal.length) {
+      lpAllocateBranches(allocations, paternal, amount / 2, `${breakdown}·父系一半`);
+      lpAllocateBranches(allocations, maternal, amount / 2, `${breakdown}·母系一半`);
+      return;
+    }
+    lpAllocateBranches(allocations, paternal.length ? paternal : maternal, amount, breakdown);
+    return;
+  }
+  lpAllocateBranches(allocations, family.branches, amount, breakdown);
+}
+
+function lpFamilyClass(people, options = {}) {
+  const descendants = lpDescendantBranches(people, options.descendants || {});
+  if (descendants.length) return { order: 1, label: options.descendantLabel || '直系卑亲属', branches: descendants };
+  const parents = lpPeopleBranches(people, ['parent']);
+  if (parents.length) return { order: 2, label: options.parentLabel || '父母', branches: parents };
+  const siblings = lpSiblingBranches(people, options.siblings || { maxDepth: 1 });
+  if (siblings.length) return { order: 3, label: options.siblingLabel || '兄弟姐妹支系', branches: siblings };
+  const grandparents = lpPeopleBranches(people, ['paternal_grandparent', 'maternal_grandparent']);
+  if (grandparents.length) return { order: 4, label: options.grandparentLabel || '祖父母辈', branches: grandparents };
+  const remote = lpPeopleBranches(people, ['uncle_aunt', 'uncle_aunt_child', 'other_collateral']);
+  if (remote.length) return { order: 5, label: options.remoteLabel || '其他旁系亲属', branches: remote };
+  return null;
+}
+
+function lpCommonWarnings(meta, context) {
+  const warnings = [];
+  if (context.estateData.mode === 'simple' && meta.simpleAssumption) warnings.push(meta.simpleAssumption);
+  if (meta.fixedCurrency && context.caseData.currency !== meta.fixedCurrency) {
+    warnings.push(`当前法律包的法定定额以 ${meta.fixedCurrency} 计价；当前显示货币不同，定额不会自动换汇。`);
+  }
+  if (context.people.filter((person) => person.relation === 'spouse' && lpAlive(person)).length > 1) {
+    warnings.push('多名生存配偶同时存在；仅第一名参与计算。');
+  }
+  if (meta.representative) warnings.push(meta.representative);
+  return warnings;
+}
+
+function lpCreatePack(meta, calculate) {
+  const fullMeta = {
+    mode: '无遗嘱继承 · 核心情景',
+    relations: lpRelationsBase,
+    groups: [],
+    personFields: [],
+    omissions: '遗嘱、税费、债务争议、胎儿份额、司法酌情调整及冲突法。',
+    ...meta
+  };
+  return {
+    meta: fullMeta,
+    relationLabels: { ...lpRelationLabels, ...(fullMeta.relationLabels || {}) },
+    statusLabels: lpStatusLabels,
+    calculate,
+    getWarnings: (context) => lpCommonWarnings(fullMeta, context)
+  };
+}
+
+function lpNoHeirWarnings(family, spouse) {
+  return !family && !spouse ? ['当前录入范围内没有找到可参与分配的人物。'] : [];
+}
+
+// China ---------------------------------------------------------------------
+
+Object.assign(cnMainland2021.meta, {
+  country: 'china', countryLabel: '中国', flag: 'CN', menuGroup: '现行法',
+  menuLabel: '中国大陆｜2021—现行', name: '中国大陆｜2021—现行', shortTitle: '《民法典》继承编',
+  effectiveLabel: '2021-01-01 起 · 现行核心规则', defaultCurrency: 'CNY',
+  relations: lpRelationsBase, groups: lpGroupsChinaMainland, personFields: [], kinshipProfile: 'cn-mainland',
+  scope: '第一、第二顺序，一般均分，以及子女与兄弟姐妹支系的代位继承。',
+  omissions: '遗嘱、胎儿份额、酌情多分少分、转继承、债税与争议事实。',
+  simpleAssumption: '省略模式假定输入额已扣除不属于死者的夫妻／共有财产份额与债务。'
+});
+cnMainland2021.relationLabels = { ...lpRelationLabels, ...cnMainland2021.relationLabels };
+cnMainland2021.statusLabels = lpStatusLabels;
+const lpCnOriginalWarnings = cnMainland2021.getWarnings.bind(cnMainland2021);
+cnMainland2021.getWarnings = (context) => [
+  ...lpCnOriginalWarnings(context),
+  ...lpCommonWarnings(cnMainland2021.meta, context)
+];
+
+function lpCalculateTaiwan(context, roc = false) {
+  const { people, estate } = context;
+  const spouse = lpFirstSpouse(people);
+  const viableDescendants = lpDescendantBranches(people);
+  const biologicalExists = viableDescendants.some((branch) => !lpAttribute(branch.root, 'isAdopted'));
+  const descendantWeight = roc && biologicalExists
+    ? (person) => lpAttribute(person, 'isAdopted') ? 0.5 : 1
+    : () => 1;
+  const family = lpFamilyClass(people, {
+    descendants: { weight: descendantWeight },
+    siblings: { maxDepth: 0 },
+    descendantLabel: '第一顺序·直系血亲卑亲属',
+    parentLabel: '第二顺序·父母',
+    siblingLabel: '第三顺序·兄弟姐妹',
+    grandparentLabel: '第四顺序·祖父母'
+  });
+  const allocations = [];
+  if (!spouse) {
+    if (family) lpAllocateBranches(allocations, family.branches, estate, family.label);
+  } else if (!family) {
+    lpAddAllocation(allocations, spouse, estate, { breakdown: '配偶单独继承' });
+  } else if (family.order === 1) {
+    const spouseBranch = { key: spouse.id, label: spouse.name, weight: 1, recipients: [{ person: spouse, fraction: 1, route: 'direct' }] };
+    lpAllocateBranches(allocations, [spouseBranch, ...family.branches], estate, '配偶与直系卑亲属共同继承');
+  } else {
+    const spouseFraction = family.order === 4 ? 2 / 3 : 1 / 2;
+    lpAddAllocation(allocations, spouse, estate * spouseFraction, { breakdown: '配偶法定份额' });
+    lpAllocateBranches(allocations, family.branches, estate * (1 - spouseFraction), family.label);
+  }
+  return {
+    order: family?.order ?? (spouse ? 0 : null),
+    orderLabel: family ? `${family.label}${spouse ? '（与配偶共同）' : ''}` : spouse ? '配偶单独继承' : null,
+    summary: family ? family.label : spouse ? '配偶取得全部' : null,
+    allocations,
+    branches: family?.branches || [],
+    warnings: lpNoHeirWarnings(family, spouse),
+    basis: [{
+      article: roc ? '民法第1138—1144条（1931文本）' : '民法第1138—1144条',
+      title: roc ? '民国法定继承代表模型' : '台湾法定继承顺序与配偶应继分',
+      text: roc
+        ? '配偶与血亲顺序共同计算；有婚生直系卑亲属时，养子女份额按婚生子女二分之一建模。女儿与儿子同一顺序。'
+        : '血亲依直系卑亲属、父母、兄弟姐妹、祖父母排序；配偶应继分随共同继承顺序变化。'
+    }]
+  };
+}
+
+const lpChinaRoc1931 = lpCreatePack({
+  id: 'cn-roc-1931', country: 'china', countryLabel: '中国', flag: 'ROC', menuGroup: '历史法',
+  menuLabel: '中华民国｜1931—1949代表', name: '中华民国｜民法继承编（大陆时期）',
+  shortTitle: '民国《民法》继承编', effectiveLabel: '1931-05-05 起 · 大陆时期代表模型',
+  defaultCurrency: 'CNY', kinshipProfile: 'cn-taiwan', groups: lpGroupsTaiwan, personFields: [lpAdoptedField],
+  scope: '法定继承顺序、配偶应继分与1931原始养子女特殊份额；女儿与儿子同一顺序。',
+  omissions: '宗祧、家产习惯、各地特别习惯、1949年后法域分化及个案过渡规则。',
+  representative: '民国大陆时期核心条文模型，非具体年代与地区个案复原。',
+  simpleAssumption: '省略模式把输入额视为已经完成夫妻财产清算的净遗产。'
+}, (context) => lpCalculateTaiwan(context, true));
+
+const lpChinaTaiwanCurrent = lpCreatePack({
+  id: 'cn-taiwan-current', country: 'china', countryLabel: '中国', flag: 'TW', menuGroup: '现行法',
+  menuLabel: '中国台湾｜1931—现行', name: '中国台湾｜1931—现行', shortTitle: '台湾地区《民法》继承编',
+  effectiveLabel: '1931-05-05 起 · 现行核心规则', defaultCurrency: 'TWD', kinshipProfile: 'cn-taiwan', groups: lpGroupsTaiwan,
+  scope: '四个血亲继承顺序、直系卑亲属代位与配偶随顺序变化的应继分。',
+  omissions: '特留分、遗嘱、归扣、限定继承债务程序及剩余财产分配请求。',
+  simpleAssumption: '省略模式把输入额视为夫妻财产制结算后的净遗产。'
+}, (context) => lpCalculateTaiwan(context, false));
+
+function lpCalculateHongKong(context) {
+  const { people, estate, pools } = context;
+  const spouse = lpFirstSpouse(people);
+  const descendants = lpDescendantBranches(people);
+  const parents = lpPeopleBranches(people, ['parent']);
+  const fullSiblings = lpSiblingBranches(people, { maxDepth: Number.POSITIVE_INFINITY, rootFilter: (p) => !lpAttribute(p, 'halfBlood') });
+  const halfSiblings = lpSiblingBranches(people, { maxDepth: Number.POSITIVE_INFINITY, rootFilter: (p) => !!lpAttribute(p, 'halfBlood') });
+  const fullUncles = lpPeopleBranches(people, ['uncle_aunt', 'uncle_aunt_child'], { filter: (p) => !lpAttribute(p, 'halfBlood') });
+  const halfUncles = lpPeopleBranches(people, ['uncle_aunt', 'uncle_aunt_child'], { filter: (p) => !!lpAttribute(p, 'halfBlood') });
+  let family = descendants.length ? { order: 1, label: '后嗣', branches: descendants }
+    : parents.length ? { order: 2, label: '父母', branches: parents }
+      : fullSiblings.length ? { order: 3, label: '全血兄弟姐妹支系', branches: fullSiblings }
+        : halfSiblings.length ? { order: 4, label: '半血兄弟姐妹支系', branches: halfSiblings }
+          : lpPeopleBranches(people, ['paternal_grandparent', 'maternal_grandparent']).length
+            ? { order: 5, label: '祖父母辈', branches: lpPeopleBranches(people, ['paternal_grandparent', 'maternal_grandparent']) }
+            : fullUncles.length ? { order: 6, label: '全血伯叔姑舅姨支系', branches: fullUncles }
+              : halfUncles.length ? { order: 7, label: '半血伯叔姑舅姨支系', branches: halfUncles }
+                : null;
+  const allocations = [];
+  const chattels = Math.min(pools.chattels, estate);
+  const residueBase = Math.max(0, estate - chattels);
+  if (!spouse) {
+    if (family) lpAllocateBranches(allocations, family.branches, estate, family.label);
+  } else if (!family) {
+    lpAddAllocation(allocations, spouse, estate, { breakdown: '配偶取得全部' });
+  } else if (family.order === 1) {
+    lpAddAllocation(allocations, spouse, chattels, { breakdown: '非土地实产' });
+    const legacy = Math.min(500_000, residueBase);
+    const balance = Math.max(0, residueBase - legacy);
+    lpAddAllocation(allocations, spouse, legacy + balance / 2, { breakdown: 'HK$500,000法定遗赠及余产一半' });
+    lpAllocateBranches(allocations, family.branches, balance / 2, '后嗣取得余产一半');
+  } else if (family.order === 2 || family.order === 3) {
+    lpAddAllocation(allocations, spouse, chattels, { breakdown: '非土地实产' });
+    const legacy = Math.min(1_000_000, residueBase);
+    const balance = Math.max(0, residueBase - legacy);
+    lpAddAllocation(allocations, spouse, legacy + balance / 2, { breakdown: 'HK$1,000,000法定遗赠及余产一半' });
+    lpAllocateBranches(allocations, family.branches, balance / 2, family.label);
+  } else {
+    lpAddAllocation(allocations, spouse, estate, { breakdown: '较远亲属存在时配偶取得全部' });
+    family = null;
+  }
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? '配偶单独继承' : null),
+    summary: family ? `香港无遗嘱顺位：${family.label}` : spouse ? '配偶取得全部' : null,
+    allocations, branches: family?.branches || [], warnings: lpNoHeirWarnings(family, spouse),
+    basis: [{ article: '《无遗嘱者遗产条例》（第73章）', title: '配偶法定遗赠及余产', text: '配偶与后嗣共同存在时取得非土地实产、HK$500,000及余产一半；没有后嗣而父母或全血兄弟姐妹支系存在时，定额为HK$1,000,000。' }]
+  };
+}
+
+const lpChinaHongKongCurrent = lpCreatePack({
+  id: 'cn-hong-kong-current', country: 'china', countryLabel: '中国', flag: 'HK', menuGroup: '现行法',
+  menuLabel: '中国香港｜1995—现行', name: '中国香港｜1995—现行', shortTitle: '《无遗嘱者遗产条例》',
+  effectiveLabel: '1995-11-03 起 · 现行核心规则', defaultCurrency: 'HKD', fixedCurrency: 'HKD', kinshipProfile: 'cn-hk',
+  relations: lpRelationsExtended, groups: lpGroupsHongKong, personFields: [lpHalfBloodField],
+  scope: '配偶取得的非土地实产、法定遗赠、余产比例及全血／半血支系顺位。',
+  omissions: '同居者酌情供养申请、遗产税历史问题、归属争议及代管程序。',
+  simpleAssumption: '省略模式无法识别非土地实产，默认该项为0并把输入额全部作为余产；要准确计算请开启财产分类。'
+}, lpCalculateHongKong);
+
+function lpCalculateMacau(context) {
+  const { people, estate } = context;
+  const spouse = lpFirstSpouse(people);
+  const descendants = lpDescendantBranches(people);
+  const ascendants = lpLiving(people, ['parent']).length
+    ? lpPeopleBranches(people, ['parent'])
+    : lpPeopleBranches(people, ['paternal_grandparent', 'maternal_grandparent']);
+  const deFacto = people.find((person) => person.relation === 'de_facto_partner' && lpAlive(person) && lpAttribute(person, 'qualifiedDeFacto'));
+  const siblings = lpSiblingBranches(people, {
+    maxDepth: Number.POSITIVE_INFINITY,
+    weight: (person) => lpAttribute(person, 'halfBlood') ? 0.5 : 1
+  });
+  const remote = lpPeopleBranches(people, ['uncle_aunt', 'uncle_aunt_child', 'other_collateral']);
+  const allocations = [];
+  let order = null;
+  let label = null;
+  let branches = [];
+  if (descendants.length) {
+    order = 1; label = '配偶与直系卑亲属'; branches = descendants;
+    if (spouse) {
+      const spouseBranch = { key: spouse.id, label: spouse.name, weight: 1, recipients: [{ person: spouse, fraction: 1, route: 'direct' }] };
+      lpAllocateBranches(allocations, [spouseBranch, ...descendants], estate, label);
+    } else lpAllocateBranches(allocations, descendants, estate, label);
+  } else if (ascendants.length) {
+    order = 2; label = '配偶与直系尊亲属'; branches = ascendants;
+    if (spouse) {
+      lpAddAllocation(allocations, spouse, estate * 2 / 3, { breakdown: '配偶三分之二' });
+      lpAllocateBranches(allocations, ascendants, estate / 3, '尊亲属三分之一');
+    } else lpAllocateBranches(allocations, ascendants, estate, label);
+  } else if (spouse) {
+    order = 3; label = '配偶单独继承'; lpAddAllocation(allocations, spouse, estate, { breakdown: label });
+  } else if (deFacto) {
+    order = 4; label = '合资格事实婚伴侣'; lpAddAllocation(allocations, deFacto, estate, { breakdown: label });
+  } else if (siblings.length) {
+    order = 5; label = '兄弟姐妹及其后代'; branches = siblings; lpAllocateBranches(allocations, siblings, estate, label);
+  } else if (remote.length) {
+    order = 6; label = '四亲等内其他旁系'; branches = remote; lpAllocateBranches(allocations, remote, estate, label);
+  }
+  return {
+    order, orderLabel: label, summary: label, allocations, branches,
+    warnings: !order ? ['当前录入范围内没有找到澳门法顺位中的合资格继承人。'] : [],
+    basis: [{ article: '《民法典》第1973、1979、1982—1987条', title: '法定继承顺序及应继份', text: '配偶与卑亲属优先；配偶与尊亲属共同继承时取三分之二。没有前三类时，合资格事实婚伴侣先于兄弟姐妹支系；全血兄弟姐妹支系按半血支系双倍权重。' }]
+  };
+}
+
+const lpChinaMacauCurrent = lpCreatePack({
+  id: 'cn-macau-current', country: 'china', countryLabel: '中国', flag: 'MO', menuGroup: '现行法',
+  menuLabel: '中国澳门｜1999—现行', name: '中国澳门｜1999—现行', shortTitle: '澳门《民法典》第五卷',
+  effectiveLabel: '1999-11-01 起 · 现行核心规则', defaultCurrency: 'MOP', kinshipProfile: 'cn-macau',
+  relations: [...lpRelationsExtended, 'de_facto_partner'], groups: lpGroupsMacau, personFields: [lpHalfBloodField, lpDeFactoField],
+  scope: '配偶、卑亲属、尊亲属、合资格事实婚伴侣及兄弟姐妹支系；全血双权重。',
+  omissions: '特留份、司法确认、事实婚其他要件、四亲等的精确亲等证明与债税。',
+  simpleAssumption: '省略模式把输入额视为财产制清算后的净遗产。'
+}, lpCalculateMacau);
+
+// Japan --------------------------------------------------------------------
+
+function lpCalculateJapanModern(context, config) {
+  const { people, estate } = context;
+  const spouse = lpFirstSpouse(people);
+  const descendants = lpDescendantBranches(people, {
+    weight: (person) => config.nonmaritalHalf && lpAttribute(person, 'isNonmarital') ? 0.5 : 1
+  });
+  const parents = lpPeopleBranches(people, ['parent']);
+  const ascendants = parents.length ? parents : lpPeopleBranches(people, ['paternal_grandparent', 'maternal_grandparent']);
+  const siblings = lpSiblingBranches(people, {
+    maxDepth: config.siblingDepth,
+    weight: (person) => lpAttribute(person, 'halfBlood') ? 0.5 : 1
+  });
+  const family = descendants.length ? { order: 1, label: '第一順位·子女及代襲后代', branches: descendants, spouseFraction: config.childSpouse }
+    : ascendants.length ? { order: 2, label: '第二順位·最近直系尊属', branches: ascendants, spouseFraction: config.parentSpouse }
+      : siblings.length ? { order: 3, label: '第三順位·兄弟姐妹支系', branches: siblings, spouseFraction: config.siblingSpouse }
+        : null;
+  const allocations = [];
+  if (spouse && family) {
+    lpAddAllocation(allocations, spouse, estate * family.spouseFraction, { breakdown: '配偶法定份额' });
+    lpAllocateBranches(allocations, family.branches, estate * (1 - family.spouseFraction), family.label);
+  } else if (spouse) lpAddAllocation(allocations, spouse, estate, { breakdown: '配偶单独继承' });
+  else if (family) lpAllocateBranches(allocations, family.branches, estate, family.label);
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? '配偶单独继承' : null),
+    summary: family ? `${family.label}${spouse ? '与配偶共同继承' : ''}` : spouse ? '配偶取得全部' : null,
+    allocations, branches: family?.branches || [], warnings: lpNoHeirWarnings(family, spouse),
+    basis: [{ article: config.article, title: config.title, text: config.text }]
+  };
+}
+
+function lpJapanMeta(id, menuLabel, effectiveLabel, extra = {}) {
+  return {
+    id, country: 'japan', countryLabel: '日本', flag: 'JP', menuGroup: extra.menuGroup || '近现代',
+    menuLabel, name: `日本｜${menuLabel}`, shortTitle: extra.shortTitle || '日本《民法》继承编', effectiveLabel,
+    defaultCurrency: 'JPY', kinshipProfile: extra.kinshipProfile || 'jp-modern', groups: lpGroupsJapanModern,
+    personFields: extra.personFields || [lpHalfBloodField],
+    scope: extra.scope || '配偶与三类血亲顺位、代袭继承及半血兄弟姐妹份额。',
+    omissions: extra.omissions || '遗言、遗留分、特别受益、贡献分、收养效力、税费及家事调停。',
+    simpleAssumption: extra.simpleAssumption || '省略模式把输入额视为婚姻财产清算后的净遗产。',
+    ...extra
+  };
+}
+
+const lpJapanCurrent = lpCreatePack(lpJapanMeta(
+  'jp-current', '2013—现行', '2013-09-05 起 · 现行核心规则'
+), (context) => lpCalculateJapanModern(context, {
+  nonmaritalHalf: false, siblingDepth: 1, childSpouse: 1 / 2, parentSpouse: 2 / 3, siblingSpouse: 3 / 4,
+  article: '民法第887、889、890、900条', title: '现行法定继承人与法定继承分',
+  text: '配偶恒为继承人；与子女及其代襲后代、直系尊属、兄弟姐妹共同继承时原则上分别取得二分之一、三分之二、四分之三。非婚生子女与婚生子女同份。'
+}));
+
+const lpJapanReform1981 = lpCreatePack(lpJapanMeta(
+  'jp-1981-2013', '昭和后期／平成｜1981—2013', '1981-01-01 至2013平等修法前',
+  { personFields: [lpNonmaritalField, lpHalfBloodField] }
+), (context) => lpCalculateJapanModern(context, {
+  nonmaritalHalf: true, siblingDepth: 1, childSpouse: 1 / 2, parentSpouse: 2 / 3, siblingSpouse: 3 / 4,
+  article: '1980年民法修正后第900条', title: '1981年后配偶份额与当时嫡出差别',
+  text: '配偶比例已提高到现行结构；本时期模型把非婚生子女份额按婚生子女二分之一处理。'
+}));
+
+const lpJapanPostwar = lpCreatePack(lpJapanMeta(
+  'jp-showa-1948-1980', '昭和战后｜1948—1980', '新民法施行后至1980年修法前',
+  { personFields: [lpNonmaritalField, lpHalfBloodField] }
+), (context) => lpCalculateJapanModern(context, {
+  nonmaritalHalf: true, siblingDepth: Number.POSITIVE_INFINITY,
+  childSpouse: 1 / 3, parentSpouse: 1 / 2, siblingSpouse: 2 / 3,
+  article: '1947年改正民法及1980年修法前第900条', title: '战后旧比例',
+  text: '配偶与子女及其代襲后代、直系尊属、兄弟姐妹共同继承时分别取三分之一、二分之一、三分之二；非婚生子女按婚生子女半份，兄弟姐妹支系可继续再代袭。'
+}));
+
+function lpHistoricalJapanCandidate(people) {
+  const all = people.filter((person) => lpAlive(person));
+  const relationRank = {
+    child: 0,
+    descendant: 1,
+    house_member: 2,
+    parent: 3,
+    paternal_grandparent: 4,
+    maternal_grandparent: 4,
+    sibling: 5,
+    sibling_child: 6
+  };
+  const designated = all.filter((person) => lpAttribute(person, 'designatedHouseHeir'));
+  const candidates = designated.length
+    ? designated
+    : all.filter((person) => Object.hasOwn(relationRank, person.relation));
+  return [...candidates].sort((left, right) => {
+    if (!!lpAttribute(left, 'designatedHouseHeir') !== !!lpAttribute(right, 'designatedHouseHeir')) return lpAttribute(left, 'designatedHouseHeir') ? -1 : 1;
+    const relationDifference = (relationRank[left.relation] ?? 9) - (relationRank[right.relation] ?? 9);
+    if (relationDifference) return relationDifference;
+    if (!!lpAttribute(left, 'isFemale') !== !!lpAttribute(right, 'isFemale')) return lpAttribute(left, 'isFemale') ? 1 : -1;
+    if (!!lpAttribute(left, 'isNonmarital') !== !!lpAttribute(right, 'isNonmarital')) return lpAttribute(left, 'isNonmarital') ? 1 : -1;
+    if (!!lpAttribute(left, 'isAdopted') !== !!lpAttribute(right, 'isAdopted')) return lpAttribute(left, 'isAdopted') ? 1 : -1;
+    return (Number(lpAttribute(left, 'birthOrder')) || 999) - (Number(lpAttribute(right, 'birthOrder')) || 999);
+  })[0] || null;
+}
+
+function lpCalculateJapanHouse(context, label) {
+  const heir = lpHistoricalJapanCandidate(context.people);
+  return {
+    order: heir ? 1 : null, orderLabel: heir ? '单独家督／家产承继人' : null,
+    summary: heir ? `${heir.name}作为单一承继人` : null,
+    allocations: heir ? [{ person: heir, amount: context.estate, breakdown: '家督／家产整体承继' }] : [],
+    branches: heir ? [{ key: heir.id, label: heir.name, recipients: [{ person: heir }] }] : [],
+    warnings: heir ? ['配偶、侧室及其他子女不因身份当然分得本模型中的家督财产；生活扶养、嫁资、隐居料或分家财产须另作剧情安排。'] : ['未找到可作为家督／家产承继人的生存人物。'],
+    basis: [{ article: label.article, title: label.title, text: label.text }]
+  };
+}
+
+const lpJapanOldFields = [lpDesignatedField, lpFemaleField, lpNonmaritalField, lpAdoptedField, lpBirthOrderField];
+const lpJapanHouseRelations = [...lpRelationsBase, 'house_member', 'concubine'];
+const lpJapanTaisho = lpCreatePack(lpJapanMeta(
+  'jp-taisho-house', '大正｜1912—1926家督继承', '旧民法家督继承 · 大正代表模型',
+  {
+    menuGroup: '旧民法／武家代表', shortTitle: '旧民法·家督继承', kinshipProfile: 'jp-house',
+    relations: lpJapanHouseRelations, groups: lpGroupsJapanHouse, personFields: lpJapanOldFields,
+    scope: '家督财产由一人承继；指定、亲等、男女性别、嫡庶／收养与长幼形成优先判断。',
+    omissions: '遗产继承与家督继承的细分、隐居、女户主、婿养子、废嫡、裁判及地方家惯例。',
+    representative: 'CoC／CoJ大正旧民法代表模型，非大正家庭财产完整复原。'
+  }
+), (context) => lpCalculateJapanHouse(context, {
+  article: '旧民法第970条等', title: '法定家督继承顺序',
+  text: '女性继承权使用特殊排序；未勾选性别时不作性别区分，勾选“女性”后，同亲等男性优先，女性在无更优先者或被指定时承继。嫡出、收养、指定与长幼同时参与排序。'
+}));
+
+const lpJapanEarlyShowa = lpCreatePack(lpJapanMeta(
+  'jp-showa-1926-1947', '昭和前期｜1926—1947家督继承', '旧民法家督继承 · 战前昭和代表模型',
+  {
+    menuGroup: '旧民法／武家代表', shortTitle: '旧民法·家督继承', kinshipProfile: 'jp-house',
+    relations: lpJapanHouseRelations, groups: lpGroupsJapanHouse, personFields: lpJapanOldFields,
+    scope: '战前户主家督财产的一人承继与男／嫡／长优先。',
+    omissions: '军人恩给、华族家范、女户主、婿养子、废嫡及家族会议个案。',
+    representative: '战前昭和跑团旧民法代表模型，非普通遗产与家督财产完整复原。'
+  }
+), (context) => lpCalculateJapanHouse(context, {
+  article: '旧民法第970条等', title: '战前家督继承',
+  text: '女性继承权使用特殊排序；未勾选性别时不作性别区分，勾选“女性”后，同亲等男性优先，女性在无更优先者或被指定时承继。指定、亲等、嫡出／身份及长幼同时参与排序。'
+}));
+
+function lpJapanCustomPack(id, menuLabel, era, text) {
+  return lpCreatePack(lpJapanMeta(id, menuLabel, era, {
+    menuGroup: '旧民法／武家代表', shortTitle: `${menuLabel.split('｜')[0]}武家家产代表模型`, kinshipProfile: 'jp-house',
+    relations: lpJapanHouseRelations, groups: lpGroupsJapanHouse, personFields: lpJapanOldFields,
+    scope: '以武家“家”的延续为核心，指定／收养、男系与长幼决定单一承继人。',
+    omissions: '身份等级、领主许可、分国法／藩法差异、寺社／町人／百姓规则及女性特殊家督。',
+    representative: `${menuLabel.split('｜')[0]}武家题材的跑团代表模型，非全国统一法律。`
+  }), (context) => lpCalculateJapanHouse(context, {
+    article: '武家家法与时代惯行（代表模型）', title: '家名与家产的一体承继', text
+  }));
+}
+
+const lpJapanEdo = lpJapanCustomPack('jp-edo-representative', '江户｜武家代表', '1603—1868 · 武家家产代表', '优先采用经承认的指定或收养继嗣；否则以最近的男性嫡系与长幼维持家名。无嗣可能导致改易／绝家，临终收养在时期与身份上受限制。');
+const lpJapanSengoku = lpJapanCustomPack('jp-sengoku-representative', '战国｜武家代表', '约1467—1600 · 武家家产代表', '家督常以指定、实力、同盟与家臣团承认为关键；模型以指定继嗣优先，其次近亲男性与长幼，仅作为剧情起点。');
+
+// United States -------------------------------------------------------------
+
+const lpUsFamilyOptions = {
+  descendants: {},
+  siblings: { maxDepth: Number.POSITIVE_INFINITY },
+  descendantLabel: '后代（按支系）',
+  parentLabel: '父母',
+  siblingLabel: '父母的后代',
+  grandparentLabel: '祖父母',
+  remoteLabel: '祖父母的后代及其他后位血亲'
+};
+
+function lpCalculateUsModern(context, config) {
+  const { people, estate } = context;
+  const spouse = lpFirstSpouse(people);
+  let family = lpFamilyClass(people, lpUsFamilyOptions);
+  if (!family && !spouse && config.includeStepchildren) {
+    const stepchildren = lpPeopleBranches(people, ['stepchild']);
+    if (stepchildren.length) family = { order: 6, label: '继子女', branches: stepchildren };
+  }
+  const descendants = family?.order === 1 ? family.branches : [];
+  const allShared = descendants.length > 0 && descendants.every((branch) => !!lpAttribute(branch.root, 'sharedWithSpouse'));
+  const spouseOther = !!lpAttribute(spouse, 'hasOtherDescendants');
+  const hasParent = people.some((person) => person.relation === 'parent' && lpAlive(person));
+  const allocations = [];
+  let spouseAmount = 0;
+  if (spouse) {
+    spouseAmount = config.spouseAmount({ estate, descendants, family, allShared, spouseOther, hasParent });
+    spouseAmount = Math.max(0, Math.min(estate, spouseAmount));
+    lpAddAllocation(allocations, spouse, spouseAmount, { breakdown: '生存配偶法定份额' });
+  }
+  const familyAmount = estate - spouseAmount;
+  if (family && familyAmount > 0) lpAllocateFamily(allocations, family, familyAmount, family.label, config.splitGrandparents !== false);
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? '生存配偶' : null),
+    summary: family ? `${config.stateName}：${family.label}` : spouse ? '生存配偶取得全部' : null,
+    allocations, branches: family?.branches || [], warnings: lpNoHeirWarnings(family, spouse),
+    basis: [{ article: config.article, title: `${config.stateName}无遗嘱继承`, text: config.text }]
+  };
+}
+
+const lpUsRelations = [...lpRelationsExtended, 'stepchild'];
+function lpUsMeta(id, stateName, abbreviation, extra = {}) {
+  return {
+    id, country: 'us', countryLabel: '美国', flag: `US-${abbreviation}`, menuGroup: extra.menuGroup || '现行州法',
+    menuLabel: `${stateName}｜${extra.period || '现行'}`, name: `美国${stateName}｜${extra.period || '现行'}`,
+    shortTitle: extra.shortTitle || `${stateName}无遗嘱继承法`, effectiveLabel: extra.effectiveLabel || '现行核心规则',
+    defaultCurrency: 'USD', fixedCurrency: 'USD', kinshipProfile: 'us', relations: lpUsRelations,
+    groups: lpGroupsUnitedStates,
+    personFields: extra.personFields || [],
+    scope: extra.scope || '配偶法定份额、后代支系、父母及父母后代的核心无遗嘱顺位。',
+    omissions: extra.omissions || '宅地豁免、家庭津贴、税债、收养／亲子身份争议、同时死亡与州际冲突法。',
+    simpleAssumption: extra.simpleAssumption || '省略模式把输入额视为已经完成所有权切分与债务清偿的净遗产。',
+    ...extra
+  };
+}
+
+const lpBlendFields = [lpSharedChildField, lpOtherDescField];
+const lpMassachusettsCurrent = lpCreatePack(lpUsMeta('us-ma-current', '马萨诸塞州', 'MA', {
+  period: '2012—现行', effectiveLabel: '2012-03-31 起 · 现行核心规则', personFields: lpBlendFields
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '马萨诸塞州', article: 'M.G.L. c.190B §§2-102—2-103',
+  text: '配偶在无后代及父母、或所有后代均为共同后代且配偶无其他后代时取得全部；其余情形适用$100,000／$200,000定额与余额比例。',
+  spouseAmount: ({ estate, descendants, allShared, spouseOther, hasParent }) => {
+    if (!descendants.length && !hasParent) return estate;
+    if (descendants.length && allShared && !spouseOther) return estate;
+    if (!descendants.length && hasParent) return Math.min(estate, 200_000 + Math.max(0, estate - 200_000) * 3 / 4);
+    return Math.min(estate, 100_000 + Math.max(0, estate - 100_000) / 2);
+  }
+}));
+
+const lpMaineCurrent = lpCreatePack(lpUsMeta('us-me-current', '缅因州', 'ME', {
+  period: '2019—现行', effectiveLabel: '2019-09-01 起 · 现行核心规则', personFields: lpBlendFields
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '缅因州', article: '18-C M.R.S. §§2-102—2-103',
+  text: '配偶全部继承的共同家庭情形外，父母存在时适用$300,000加余额四分之三；重组家庭常适用$100,000加余额二分之一或余额二分之一。',
+  spouseAmount: ({ estate, descendants, allShared, spouseOther, hasParent }) => {
+    if (!descendants.length && !hasParent) return estate;
+    if (descendants.length && allShared && !spouseOther) return estate;
+    if (!descendants.length && hasParent) return Math.min(estate, 300_000 + Math.max(0, estate - 300_000) * 3 / 4);
+    if (allShared) return Math.min(estate, 100_000 + Math.max(0, estate - 100_000) / 2);
+    return estate / 2;
+  }
+}));
+
+const lpNewHampshireCurrent = lpCreatePack(lpUsMeta('us-nh-current', '新罕布什尔州', 'NH', {
+  period: '2021—现行', effectiveLabel: '2021-07-01 起 · 现行核心规则', personFields: lpBlendFields
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '新罕布什尔州', article: 'N.H. RSA 561:1',
+  text: '依共同后代、配偶另有后代及父母是否生存，配偶定额为$100,000、$150,000或$250,000，并取得相应余额比例。',
+  spouseAmount: ({ estate, descendants, allShared, spouseOther, hasParent }) => {
+    if (!descendants.length && !hasParent) return estate;
+    if (!descendants.length) return Math.min(estate, 250_000 + Math.max(0, estate - 250_000) * 3 / 4);
+    if (allShared && !spouseOther) return Math.min(estate, 250_000 + Math.max(0, estate - 250_000) / 2);
+    const threshold = allShared ? 150_000 : 100_000;
+    return Math.min(estate, threshold + Math.max(0, estate - threshold) / 2);
+  }
+}));
+
+const lpConnecticutCurrent = lpCreatePack(lpUsMeta('us-ct-current', '康涅狄格州', 'CT', {
+  period: '1985—现行', effectiveLabel: '1985-07-01 起 · 现行核心规则', groups: lpGroupsConnecticut,
+  personFields: [lpSharedChildField]
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '康涅狄格州', article: 'Conn. Gen. Stat. §§45a-437—45a-439',
+  splitGrandparents: false, includeStepchildren: true,
+  text: '无后代与父母时配偶取得全部；父母存在时取得$100,000加余额四分之三；共同后代时为$100,000加余额二分之一，非共同后代时为二分之一。没有生存配偶及更前亲属时，继子女进入分配。',
+  spouseAmount: ({ estate, descendants, allShared, hasParent }) => {
+    if (!descendants.length && !hasParent) return estate;
+    if (!descendants.length) return Math.min(estate, 100_000 + Math.max(0, estate - 100_000) * 3 / 4);
+    if (allShared) return Math.min(estate, 100_000 + Math.max(0, estate - 100_000) / 2);
+    return estate / 2;
+  }
+}));
+
+const lpVermontCurrent = lpCreatePack(lpUsMeta('us-vt-current', '佛蒙特州', 'VT', {
+  period: '2018—现行', effectiveLabel: '2018-07-01 起 · 现行核心规则', personFields: [lpSharedChildField]
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '佛蒙特州', article: '14 V.S.A. §311',
+  text: '没有后代或所有后代同时也是生存配偶的后代时，配偶取得全部；存在非共同后代时，配偶取得二分之一。',
+  spouseAmount: ({ estate, descendants, allShared }) => !descendants.length || allShared ? estate : estate / 2
+}));
+
+const lpNewYorkCurrent = lpCreatePack(lpUsMeta('us-ny-current', '纽约州', 'NY', {
+  period: '1992—现行', effectiveLabel: '1992-09-01 起 · 现行核心规则'
+}), (context) => lpCalculateUsModern(context, {
+  stateName: '纽约州', article: 'EPTL §4-1.1',
+  text: '配偶与后代共同存在时，配偶取得$50,000及余额二分之一；无后代时配偶取得全部。后代按表示制／支系分配。',
+  spouseAmount: ({ estate, descendants }) => descendants.length
+    ? Math.min(estate, 50_000 + Math.max(0, estate - 50_000) / 2)
+    : estate
+}));
+
+function lpCalculateCalifornia(context) {
+  const { people, estate, pools, estateData } = context;
+  const spouse = lpFirstSpouse(people);
+  const family = lpFamilyClass(people, lpUsFamilyOptions);
+  const allocations = [];
+  const community = pools.community;
+  const separate = Math.max(0, estate - community);
+  if (!spouse) {
+    if (family) lpAllocateFamily(allocations, family, estate, family.label, true);
+  } else {
+    lpAddAllocation(allocations, spouse, community, { breakdown: '死者一半共同／准共同财产' });
+    let separateFraction = 1;
+    if (family?.order === 1) separateFraction = family.branches.length === 1 ? 1 / 2 : 1 / 3;
+    else if (family && [2, 3].includes(family.order)) separateFraction = 1 / 2;
+    lpAddAllocation(allocations, spouse, separate * separateFraction, { breakdown: '单独财产中的配偶份额' });
+    if (family) lpAllocateFamily(allocations, family, separate * (1 - separateFraction), family.label, true);
+  }
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? '生存配偶' : null),
+    summary: family ? `共同财产与单独财产分池 · ${family.label}` : spouse ? '配偶取得全部' : null,
+    allocations, branches: family?.branches || [],
+    warnings: [
+      ...lpNoHeirWarnings(family, spouse),
+      ...(estateData.mode === 'simple' ? ['省略模式把全部输入额当作单独财产；加州共同财产案件建议开启财产分类。'] : [])
+    ],
+    basis: [{ article: 'Cal. Probate Code §§100, 6401—6402', title: '共同财产与单独财产分别计算', text: '生存配偶本已拥有共同财产的一半；进入遗产的死者一半共同／准共同财产由配偶取得，单独财产份额依后代支系数量及父母／兄弟姐妹支系变化。' }]
+  };
+}
+
+const lpCaliforniaCurrent = lpCreatePack(lpUsMeta('us-ca-current', '加利福尼亚州', 'CA', {
+  period: '1991—现行', effectiveLabel: '1991-07-01 起 · 现行核心规则',
+  scope: '共同／准共同财产的死者份额与单独财产分池，并计算配偶及血亲顺位。',
+  simpleAssumption: '省略模式默认全部为单独财产；共同财产情景请开启财产分类。'
+}), lpCalculateCalifornia);
+
+function lpCalculateRhodeIsland(context) {
+  const { people, pools, estate, estateData } = context;
+  const spouse = lpFirstSpouse(people);
+  const family = lpFamilyClass(people, lpUsFamilyOptions);
+  const allocations = [];
+  const personalty = pools.personalty;
+  const realty = pools.immovable;
+  let spousePersonal = 0;
+  if (spouse) {
+    if (!family) spousePersonal = personalty;
+    else if (family.order === 1) spousePersonal = personalty / 2;
+    else spousePersonal = Math.min(personalty, 50_000 + Math.max(0, personalty - 50_000) / 2);
+    lpAddAllocation(allocations, spouse, spousePersonal, { breakdown: '动产中的配偶份额' });
+  }
+  if (family) lpAllocateBranches(allocations, family.branches, personalty - spousePersonal + realty, `${family.label}的动产余额及不动产所有权`);
+  else if (spouse) lpAddAllocation(allocations, spouse, realty, { breakdown: '无其他录入血亲时的不动产所有权' });
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? '生存配偶' : null),
+    summary: estateData.mode === 'detailed' ? '动产与不动产分别计算' : '省略模式按全为动产计算',
+    allocations, branches: family?.branches || [],
+    specialInterests: spouse && realty > 0 ? [{ personId: spouse.id, name: spouse.name, label: '生存配偶对全部不动产的终身权益', amount: realty }] : [],
+    warnings: [
+      ...lpNoHeirWarnings(family, spouse),
+      ...(spouse && realty > 0 ? ['终身权益不与不动产所有权金额相加；法院另可酌情给予不超过$150,000的不动产完全权，本计算不自动加入。'] : [])
+    ],
+    basis: [{ article: 'R.I. Gen. Laws §§33-1-1, 33-1-5, 33-1-6, 33-1-10', title: '不动产终身权益与动产份额', text: '配偶对不动产享终身权益；动产在有后代时取一半，无后代但有其他亲属时取$50,000加余额一半。' }]
+  };
+}
+
+const lpRhodeIslandCurrent = lpCreatePack(lpUsMeta('us-ri-current', '罗德岛州', 'RI', {
+  period: '2014—现行', effectiveLabel: '2014-07-01 起 · 现行核心规则',
+  scope: '动产份额、不动产所有权与配偶终身权益分开呈现。',
+  simpleAssumption: '省略模式把全部输入额当作动产，因此不会生成不动产终身权益；建议开启财产分类。'
+}), lpCalculateRhodeIsland);
+
+function lpCalculateUs1920s(context, config) {
+  const { people, pools, estateData } = context;
+  const femaleDecedent = lpDecedentSex(context) === 'female';
+  const spouse = lpFirstSpouse(people);
+  const family = lpFamilyClass(people, lpUsFamilyOptions);
+  const allocations = [];
+  const personalty = pools.personalty;
+  const realty = pools.immovable;
+  let spousePersonal = 0;
+  if (spouse) {
+    if (!family) spousePersonal = personalty;
+    else if (family.order === 1) spousePersonal = personalty / 3;
+    else if (config.fixedNoIssue) spousePersonal = Math.min(personalty, config.fixedNoIssue + Math.max(0, personalty - config.fixedNoIssue) / 2);
+    else spousePersonal = personalty / 2;
+    lpAddAllocation(allocations, spouse, spousePersonal, { breakdown: femaleDecedent ? '1920年代鳏夫动产份额' : '1920年代遗孀动产份额' });
+  }
+  if (family) lpAllocateBranches(allocations, family.branches, personalty - spousePersonal + realty, `${family.label}的动产余额及不动产所有权`);
+  else if (spouse) lpAddAllocation(allocations, spouse, realty, { breakdown: '无其他录入亲属时不动产所有权' });
+  const sharedIssue = people.some((person) => person.relation === 'child' && !!lpAttribute(person, 'sharedWithSpouse'));
+  const lifeInterestApplies = spouse && realty > 0 && (!femaleDecedent || sharedIssue);
+  const lifeLabel = femaleDecedent ? '鳏夫对全部不动产的终身地产权（普通法代表）' : config.lifeLabel;
+  const lifeFraction = femaleDecedent ? 1 : config.lifeFraction;
+  return {
+    order: family?.order ?? (spouse ? 0 : null), orderLabel: family?.label || (spouse ? (femaleDecedent ? '鳏夫' : '遗孀') : null),
+    summary: estateData.mode === 'detailed' ? `1920年代${femaleDecedent ? '女性' : '男性'}死者的动产／不动产代表分流` : '省略模式按全为动产',
+    allocations, branches: family?.branches || [],
+    specialInterests: lifeInterestApplies ? [{ personId: spouse.id, name: spouse.name, label: lifeLabel, amount: realty * lifeFraction }] : [],
+    warnings: [
+      ...lpNoHeirWarnings(family, spouse),
+      ...(femaleDecedent && spouse && realty > 0 && !sharedIssue ? ['未勾选与生存配偶的共同子女；本次计算不列鳏夫终身地产权。'] : []),
+      ...(lifeInterestApplies ? ['终身权益是使用收益权，不与所有权金额相加。'] : [])
+    ],
+    basis: [{ article: config.article, title: `${config.stateName}1920年代代表模型`, text: femaleDecedent ? `${config.text} 女性死者的不动产终身权益使用普通法鳏夫终身地产权代表规则。` : config.text }]
+  };
+}
+
+function lpUs1920Pack(id, stateName, abbr, config) {
+  return lpCreatePack(lpUsMeta(id, stateName, abbr, {
+    menuGroup: '1920年代（CoC）', period: '1920年代代表', effectiveLabel: '约1920—1929 · 跑团代表模型',
+    personFields: [lpSharedChildField],
+    scope: '禁酒令／克苏鲁年代，死者性别、动产份额、不动产所有权与配偶终身权益分别计算。',
+    omissions: '具体死亡年份的修法切点、寡妇／鳏夫终身地产权的放弃、宅地、寡妇津贴、族裔身份旧法与法院裁量。',
+    simpleAssumption: '省略模式默认全部是动产；涉及房产、农庄或庄园时请开启财产分类。',
+    representative: `${stateName}1920年代叙事代表模型；具体死亡年份与案件事实请自行考证。`
+  }), (context) => lpCalculateUs1920s(context, { stateName, ...config }));
+}
+
+const lpMassachusetts1920 = lpUs1920Pack('us-ma-1920s', '马萨诸塞州', 'MA', {
+  fixedNoIssue: 5_000, lifeFraction: 1 / 3, lifeLabel: '寡妇对三分之一不动产的终身权益（代表）',
+  article: '马萨诸塞州《普通法汇编》（Massachusetts General Laws）第190章，1921年版代表',
+  text: '有后代时配偶取三分之一动产，并另列寡妇对三分之一不动产的终身地产权；无后代而有近亲时，以$5,000加动产余额一半作代表计算。'
+});
+const lpRhodeIsland1920 = lpUs1920Pack('us-ri-1920s', '罗德岛州', 'RI', {
+  fixedNoIssue: 0, lifeFraction: 1, lifeLabel: '寡妇对全部不动产的终身权益（时期代表）',
+  article: '罗德岛州继承与遗产分配法规（1920年代代表）',
+  text: '有后代时配偶取三分之一动产；不动产另显示时期性的配偶终身权益，所有权由血亲顺位承接。'
+});
+const lpNewYork1920 = lpUs1920Pack('us-ny-1920s', '纽约州', 'NY', {
+  fixedNoIssue: 0, lifeFraction: 1 / 3, lifeLabel: '寡妇对三分之一不动产的终身地产权',
+  article: '纽约州《死者遗产法》（Decedent Estate Law）前后时期规则（代表）',
+  text: '按传统动产分配与寡妇终身地产权分别计算1920年代常见情景；1929年法制重整附近案件必须按死亡日期另查。'
+});
+
+// Victorian England & Wales -------------------------------------------------
+
+const lpVictorianFamilyOptions = {
+  descendants: {},
+  siblings: { maxDepth: Number.POSITIVE_INFINITY },
+  descendantLabel: '后代 · 动产路线',
+  parentLabel: '最近亲 · 父母',
+  siblingLabel: '最近亲 · 兄弟姐妹支系',
+  grandparentLabel: '最近亲 · 祖父母',
+  remoteLabel: '较远旁系'
+};
+
+function lpVictorianRealBranches(people) {
+  const children = people.filter((person) => person.relation === 'child' && lpAlive(person));
+  const sons = children.filter((person) => !lpAttribute(person, 'isFemale'));
+  if (sons.length) {
+    const eldest = [...sons].sort((a, b) => (Number(lpAttribute(a, 'birthOrder')) || 999) - (Number(lpAttribute(b, 'birthOrder')) || 999))[0];
+    return lpPeopleBranches([eldest], ['child']);
+  }
+  const daughters = children.filter((person) => lpAttribute(person, 'isFemale'));
+  if (daughters.length) return lpPeopleBranches(daughters, ['child']);
+  const father = people.find((person) => person.relation === 'parent' && lpAlive(person) && !lpAttribute(person, 'isFemale'));
+  if (father) return lpPeopleBranches([father], ['parent']);
+  const brothers = people.filter((person) => person.relation === 'sibling' && lpAlive(person) && !lpAttribute(person, 'isFemale'));
+  if (brothers.length) {
+    const eldest = [...brothers].sort((a, b) => (Number(lpAttribute(a, 'birthOrder')) || 999) - (Number(lpAttribute(b, 'birthOrder')) || 999))[0];
+    return lpPeopleBranches([eldest], ['sibling']);
+  }
+  return lpFamilyClass(people, lpVictorianFamilyOptions)?.branches || [];
+}
+
+function lpCalculateVictorian(context) {
+  const { people, pools, estateData } = context;
+  const femaleDecedent = lpDecedentSex(context) === 'female';
+  const spouse = lpFirstSpouse(people);
+  const personalFamily = lpFamilyClass(people, lpVictorianFamilyOptions);
+  const realBranches = lpVictorianRealBranches(people);
+  const allocations = [];
+  const personalty = pools.personalty;
+  const realty = pools.immovable;
+  let spousePersonal = 0;
+  if (spouse) {
+    if (femaleDecedent) spousePersonal = personalty;
+    else if (!personalFamily) spousePersonal = personalty;
+    else if (personalFamily.order === 1) spousePersonal = personalty / 3;
+    else spousePersonal = Math.min(personalty, 500 + Math.max(0, personalty - 500) / 2);
+    lpAddAllocation(allocations, spouse, spousePersonal, { breakdown: femaleDecedent ? '丈夫的动产权益' : '遗孀的动产份额' });
+  }
+  if (personalFamily) lpAllocateBranches(allocations, personalFamily.branches, personalty - spousePersonal, '动产余份');
+  if (realBranches.length) lpAllocateBranches(allocations, realBranches, realty, '不动产所有权');
+  const sharedIssue = people.some((person) => person.relation === 'child' && !!lpAttribute(person, 'sharedWithSpouse'));
+  const lifeInterest = !spouse || realty <= 0
+    ? []
+    : femaleDecedent
+      ? sharedIssue ? [{ personId: spouse.id, name: spouse.name, label: '鳏夫对全部不动产的终身地产权', amount: realty }] : []
+      : [{ personId: spouse.id, name: spouse.name, label: '遗孀对三分之一不动产的终身地产权（若未被排除）', amount: realty / 3 }];
+  return {
+    order: personalFamily?.order ?? (spouse ? 0 : null),
+    orderLabel: personalFamily?.label || (spouse ? (femaleDecedent ? '鳏夫' : '遗孀') : null),
+    summary: estateData.mode === 'detailed' ? `维多利亚${femaleDecedent ? '女性' : '男性'}死者的动产与不动产分别继承` : '省略模式按全为动产',
+    allocations, branches: personalFamily?.branches || [],
+    specialInterests: lifeInterest,
+    warnings: [
+      ...lpNoHeirWarnings(personalFamily, spouse),
+      femaleDecedent
+        ? '女性死者分支：生存丈夫取得动产；勾选共同子女后另列鳏夫终身地产权。'
+        : '男性死者分支：遗孀取得动产份额，并另列寡妇终身地产权。',
+      ...(femaleDecedent && spouse && realty > 0 && !sharedIssue ? ['未勾选与生存配偶的共同子女；本次计算不列鳏夫终身地产权。'] : []),
+      ...(lifeInterest.length ? ['寡妇／鳏夫终身地产权不与不动产所有权金额相加；授产安排、契据及地产性质请自行考证。'] : [])
+    ],
+    basis: femaleDecedent ? [
+      { article: '《1882年已婚妇女财产法》（Married Women’s Property Act 1882）第1—2、23条', title: '已婚女性独立财产', text: '1883年起，已婚女性可单独持有不动产与动产，死亡后由其遗产代表处理。' },
+      { article: '普通法丈夫权益及鳏夫终身地产权', title: '丈夫权益', text: '丈夫取得妻子未立遗嘱遗留的动产；婚内有可继承后代时，对妻子的不动产另列鳏夫终身地产权。' },
+      { article: '《1833年继承法》（Inheritance Act 1833）', title: '不动产分流与男性长子优先', text: '不动产所有权按当时普通法继嗣路线建模：儿子中长子优先，无儿子时女儿共同承继。' }
+    ] : [
+      { article: '《1670年遗产分配法》（Statute of Distribution 1670）；《1890年无遗嘱者遗产法》（Intestates’ Estates Act 1890）', title: '动产分配', text: '有后代时遗孀通常取三分之一动产；无后代但有近亲时，1890法案给予£500优先额及余额一半。' },
+      { article: '《1833年继承法》（Inheritance Act 1833）及寡妇终身地产权规则', title: '不动产分流与男性长子优先', text: '不动产所有权按当时普通法继嗣路线建模：儿子中长子优先，无儿子时女儿共同承继；遗孀对丈夫不动产的终身地产权另列。' }
+    ]
+  };
+}
+
+const lpVictorian1890 = lpCreatePack({
+  id: 'uk-ew-victorian-1890s', country: 'uk', countryLabel: '英国', flag: 'GB', menuGroup: '历史法',
+  menuLabel: '英格兰与威尔士｜1890年代维多利亚', name: '英格兰与威尔士｜1890年代',
+  shortTitle: '维多利亚时代无遗嘱继承代表模型', effectiveLabel: '1890—1899 · 区分死者性别',
+  defaultCurrency: 'GBP', fixedCurrency: 'GBP', kinshipProfile: 'uk-victorian', relations: lpRelationsExtended, groups: lpGroupsVictorian,
+  personFields: [lpFemaleField, lpBirthOrderField, lpSharedChildField],
+  scope: '动产与不动产分别计算；男性死者使用遗孀份额与寡妇终身地产权，女性死者使用丈夫的动产权益与鳏夫终身地产权。',
+  omissions: '公簿持有地、限嗣继承的不动产、授产安排、苏格兰与爱尔兰规则、婚约、地产契据、教会法院程序及鳏夫终身地产权的资格细节。',
+  simpleAssumption: '省略模式把全部金额当作动产；庄园、土地或房屋情景请开启财产分类。',
+  representative: '1890年代英格兰与威尔士叙事模型，非地产继承完整复原。'
+}, lpCalculateVictorian);
+
+// Kinship terminology and legal classifications ----------------------------
+
+const kinshipKeys = ['father', 'mother', 'husband', 'wife', 'older_brother', 'younger_brother', 'older_sister', 'younger_sister', 'son', 'daughter'];
+
+const lpKinshipLabelsCn = {
+  father: '父亲', mother: '母亲', husband: '丈夫', wife: '妻子', older_brother: '哥哥', younger_brother: '弟弟',
+  older_sister: '姐姐', younger_sister: '妹妹', son: '儿子', daughter: '女儿'
+};
+const lpKinshipLabelsJp = {
+  father: '父／ちち', mother: '母／はは', husband: '夫／おっと', wife: '妻／つま', older_brother: '兄／あに', younger_brother: '弟／おとうと',
+  older_sister: '姉／あね', younger_sister: '妹／いもうと', son: '息子／むすこ', daughter: '娘／むすめ'
+};
+const lpKinshipLabelsEn = {
+  father: '父亲 / father', mother: '母亲 / mother', husband: '丈夫 / husband', wife: '妻子 / wife',
+  older_brother: '哥哥 / brother', younger_brother: '弟弟 / brother', older_sister: '姐姐 / sister', younger_sister: '妹妹 / sister',
+  son: '儿子 / son', daughter: '女儿 / daughter'
+};
+
+const lpKinshipNamesCn = {
+  father: '父亲', mother: '母亲', husband: '丈夫', wife: '妻子', older_brother: '哥哥', younger_brother: '弟弟', older_sister: '姐姐', younger_sister: '妹妹', son: '儿子', daughter: '女儿',
+  'father.father': '祖父／爷爷', 'father.mother': '祖母／奶奶', 'mother.father': '外祖父／外公', 'mother.mother': '外祖母／外婆',
+  'father.older_brother': '伯父', 'father.younger_brother': '叔父', 'father.older_sister': '姑母', 'father.younger_sister': '姑母',
+  'mother.older_brother': '舅舅', 'mother.younger_brother': '舅舅', 'mother.older_sister': '姨母', 'mother.younger_sister': '姨母',
+  'older_brother.son': '侄子', 'younger_brother.son': '侄子', 'older_brother.daughter': '侄女', 'younger_brother.daughter': '侄女',
+  'older_sister.son': '外甥', 'younger_sister.son': '外甥', 'older_sister.daughter': '外甥女', 'younger_sister.daughter': '外甥女',
+  'son.son': '孙子', 'son.daughter': '孙女', 'daughter.son': '外孙', 'daughter.daughter': '外孙女',
+  'older_brother.wife': '嫂子', 'younger_brother.wife': '弟媳', 'older_sister.husband': '姐夫', 'younger_sister.husband': '妹夫',
+  'older_brother.husband': '哥哥的丈夫', 'younger_brother.husband': '弟弟的丈夫',
+  'older_sister.wife': '姐姐的妻子', 'younger_sister.wife': '妹妹的妻子',
+  'husband.father': '公公', 'husband.mother': '婆婆', 'wife.father': '岳父', 'wife.mother': '岳母',
+  'husband.older_brother': '大伯哥', 'husband.younger_brother': '小叔子', 'husband.older_sister': '大姑姐', 'husband.younger_sister': '小姑子',
+  'wife.older_brother': '大舅哥', 'wife.younger_brother': '小舅子', 'wife.older_sister': '大姨姐', 'wife.younger_sister': '小姨子',
+  'son.wife': '儿媳', 'daughter.husband': '女婿', 'son.husband': '儿子的丈夫', 'daughter.wife': '女儿的妻子',
+  'father.older_brother.wife': '伯母', 'father.younger_brother.wife': '婶婶',
+  'father.older_sister.husband': '姑父', 'father.younger_sister.husband': '姑父',
+  'mother.older_brother.wife': '舅妈', 'mother.younger_brother.wife': '舅妈',
+  'mother.older_sister.husband': '姨父', 'mother.younger_sister.husband': '姨父',
+  'father.father.daughter': '姑母', 'father.mother.daughter': '姑母',
+  'mother.father.son': '舅舅', 'mother.mother.son': '舅舅',
+  'older_brother.son.wife': '侄媳妇', 'younger_brother.son.wife': '侄媳妇',
+  'older_brother.daughter.husband': '侄女婿', 'younger_brother.daughter.husband': '侄女婿',
+  'older_sister.son.wife': '外甥媳妇', 'younger_sister.son.wife': '外甥媳妇',
+  'older_sister.daughter.husband': '外甥女婿', 'younger_sister.daughter.husband': '外甥女婿',
+  'son.son.wife': '孙媳妇', 'son.daughter.husband': '孙女婿',
+  'daughter.son.wife': '外孙媳妇', 'daughter.daughter.husband': '外孙女婿',
+  'husband.older_brother.wife': '妯娌（丈夫哥哥的妻子）', 'husband.younger_brother.wife': '妯娌（丈夫弟弟的妻子）',
+  'wife.older_sister.husband': '连襟（妻子姐姐的丈夫）', 'wife.younger_sister.husband': '连襟（妻子妹妹的丈夫）',
+  'husband.older_brother.son': '夫家侄子', 'husband.younger_brother.son': '夫家侄子',
+  'husband.older_brother.daughter': '夫家侄女', 'husband.younger_brother.daughter': '夫家侄女',
+  'husband.older_sister.son': '夫家外甥', 'husband.younger_sister.son': '夫家外甥',
+  'husband.older_sister.daughter': '夫家外甥女', 'husband.younger_sister.daughter': '夫家外甥女',
+  'wife.older_brother.son': '内侄', 'wife.younger_brother.son': '内侄',
+  'wife.older_brother.daughter': '内侄女', 'wife.younger_brother.daughter': '内侄女',
+  'wife.older_sister.son': '妻子的外甥', 'wife.younger_sister.son': '妻子的外甥',
+  'wife.older_sister.daughter': '妻子的外甥女', 'wife.younger_sister.daughter': '妻子的外甥女',
+  'son.wife.father': '亲家公', 'son.wife.mother': '亲家母',
+  'daughter.husband.father': '亲家公', 'daughter.husband.mother': '亲家母',
+  'son.husband.father': '亲家公', 'son.husband.mother': '亲家母',
+  'daughter.wife.father': '亲家公', 'daughter.wife.mother': '亲家母'
+};
+const lpKinshipNamesJp = {
+  father: '父（ちち）', mother: '母（はは）', husband: '夫（おっと）', wife: '妻（つま）', older_brother: '兄（あに）', younger_brother: '弟（おとうと）', older_sister: '姉（あね）', younger_sister: '妹（いもうと）', son: '息子（むすこ）', daughter: '娘（むすめ）',
+  'father.father': '祖父（そふ）', 'father.mother': '祖母（そぼ）', 'mother.father': '祖父（そふ）', 'mother.mother': '祖母（そぼ）',
+  'father.older_brother': '伯父（おじ）', 'father.younger_brother': '叔父（おじ）', 'mother.older_brother': '伯父／叔父（おじ）', 'mother.younger_brother': '伯父／叔父（おじ）',
+  'father.older_sister': '伯母（おば）', 'father.younger_sister': '叔母（おば）', 'mother.older_sister': '伯母／叔母（おば）', 'mother.younger_sister': '伯母／叔母（おば）',
+  'older_brother.son': '甥（おい）', 'younger_brother.son': '甥（おい）', 'older_sister.son': '甥（おい）', 'younger_sister.son': '甥（おい）',
+  'older_brother.daughter': '姪（めい）', 'younger_brother.daughter': '姪（めい）', 'older_sister.daughter': '姪（めい）', 'younger_sister.daughter': '姪（めい）',
+  'son.son': '孫（まご）', 'son.daughter': '孫（まご）', 'daughter.son': '孫（まご）', 'daughter.daughter': '孫（まご）',
+  'older_brother.wife': '兄の妻（あにのつま）／義姉', 'younger_brother.wife': '弟の妻（おとうとのつま）／義妹',
+  'older_sister.husband': '姉の夫（あねのおっと）／義兄', 'younger_sister.husband': '妹の夫（いもうとのおっと）／義弟',
+  'older_brother.husband': '兄の夫（あにのおっと）', 'younger_brother.husband': '弟の夫（おとうとのおっと）',
+  'older_sister.wife': '姉の妻（あねのつま）', 'younger_sister.wife': '妹の妻（いもうとのつま）',
+  'husband.father': '義父（ぎふ）', 'husband.mother': '義母（ぎぼ）', 'wife.father': '義父（ぎふ）', 'wife.mother': '義母（ぎぼ）',
+  'husband.older_brother': '夫の兄（おっとのあに）／義兄', 'husband.younger_brother': '夫の弟（おっとのおとうと）／義弟',
+  'husband.older_sister': '夫の姉（おっとのあね）／義姉', 'husband.younger_sister': '夫の妹（おっとのいもうと）／義妹',
+  'wife.older_brother': '妻の兄（つまのあに）／義兄', 'wife.younger_brother': '妻の弟（つまのおとうと）／義弟',
+  'wife.older_sister': '妻の姉（つまのあね）／義姉', 'wife.younger_sister': '妻の妹（つまのいもうと）／義妹',
+  'son.wife': '息子の妻（むすこのつま）／嫁', 'daughter.husband': '娘の夫（むすめのおっと）／婿',
+  'son.husband': '息子の夫（むすこのおっと）', 'daughter.wife': '娘の妻（むすめのつま）',
+  'father.older_brother.wife': '伯母（おば）', 'father.younger_brother.wife': '叔母（おば）',
+  'father.older_sister.husband': '伯父（おじ）', 'father.younger_sister.husband': '叔父（おじ）',
+  'mother.older_brother.wife': '伯母（おば）', 'mother.younger_brother.wife': '叔母（おば）',
+  'mother.older_sister.husband': '伯父（おじ）', 'mother.younger_sister.husband': '叔父（おじ）',
+  'father.father.daughter': '伯母／叔母（おば）', 'father.mother.daughter': '伯母／叔母（おば）',
+  'mother.father.son': '伯父／叔父（おじ）', 'mother.mother.son': '伯父／叔父（おじ）',
+  'son.wife.father': '息子の妻の父', 'son.wife.mother': '息子の妻の母',
+  'daughter.husband.father': '娘の夫の父', 'daughter.husband.mother': '娘の夫の母',
+  'son.husband.father': '息子の夫の父', 'son.husband.mother': '息子の夫の母',
+  'daughter.wife.father': '娘の妻の父', 'daughter.wife.mother': '娘の妻の母'
+};
+const lpKinshipNamesEn = {
+  father: '父亲 / father', mother: '母亲 / mother', husband: '丈夫 / husband', wife: '妻子 / wife', older_brother: '哥哥 / brother', younger_brother: '弟弟 / brother', older_sister: '姐姐 / sister', younger_sister: '妹妹 / sister', son: '儿子 / son', daughter: '女儿 / daughter',
+  'father.father': '祖父 / grandfather', 'father.mother': '祖母 / grandmother', 'mother.father': '外祖父 / grandfather', 'mother.mother': '外祖母 / grandmother',
+  'father.older_brother': '伯父 / uncle', 'father.younger_brother': '叔父 / uncle', 'mother.older_brother': '舅舅 / uncle', 'mother.younger_brother': '舅舅 / uncle',
+  'father.older_sister': '姑母 / aunt', 'father.younger_sister': '姑母 / aunt', 'mother.older_sister': '姨母 / aunt', 'mother.younger_sister': '姨母 / aunt',
+  'older_brother.son': '侄子 / nephew', 'younger_brother.son': '侄子 / nephew', 'older_sister.son': '外甥 / nephew', 'younger_sister.son': '外甥 / nephew',
+  'older_brother.daughter': '侄女 / niece', 'younger_brother.daughter': '侄女 / niece', 'older_sister.daughter': '外甥女 / niece', 'younger_sister.daughter': '外甥女 / niece',
+  'son.son': '孙子 / grandson', 'son.daughter': '孙女 / granddaughter', 'daughter.son': '外孙 / grandson', 'daughter.daughter': '外孙女 / granddaughter',
+  'older_brother.wife': '嫂子 / sister-in-law', 'younger_brother.wife': '弟媳 / sister-in-law',
+  'older_sister.husband': '姐夫 / brother-in-law', 'younger_sister.husband': '妹夫 / brother-in-law',
+  'older_brother.husband': '哥哥的丈夫 / brother-in-law', 'younger_brother.husband': '弟弟的丈夫 / brother-in-law',
+  'older_sister.wife': '姐姐的妻子 / sister-in-law', 'younger_sister.wife': '妹妹的妻子 / sister-in-law',
+  'husband.father': '公公 / father-in-law', 'husband.mother': '婆婆 / mother-in-law',
+  'wife.father': '岳父 / father-in-law', 'wife.mother': '岳母 / mother-in-law',
+  'husband.older_brother': '大伯哥 / brother-in-law', 'husband.younger_brother': '小叔子 / brother-in-law',
+  'husband.older_sister': '大姑姐 / sister-in-law', 'husband.younger_sister': '小姑子 / sister-in-law',
+  'wife.older_brother': '大舅哥 / brother-in-law', 'wife.younger_brother': '小舅子 / brother-in-law',
+  'wife.older_sister': '大姨姐 / sister-in-law', 'wife.younger_sister': '小姨子 / sister-in-law',
+  'son.wife': '儿媳 / daughter-in-law', 'daughter.husband': '女婿 / son-in-law',
+  'son.husband': '儿子的丈夫 / son-in-law', 'daughter.wife': '女儿的妻子 / daughter-in-law',
+  'father.older_brother.wife': '伯母 / aunt', 'father.younger_brother.wife': '婶婶 / aunt',
+  'father.older_sister.husband': '姑父 / uncle', 'father.younger_sister.husband': '姑父 / uncle',
+  'mother.older_brother.wife': '舅妈 / aunt', 'mother.younger_brother.wife': '舅妈 / aunt',
+  'mother.older_sister.husband': '姨父 / uncle', 'mother.younger_sister.husband': '姨父 / uncle',
+  'father.father.daughter': '姑母 / aunt', 'father.mother.daughter': '姑母 / aunt',
+  'mother.father.son': '舅舅 / uncle', 'mother.mother.son': '舅舅 / uncle',
+  'older_brother.son.wife': '侄媳妇 / niece-in-law', 'younger_brother.son.wife': '侄媳妇 / niece-in-law',
+  'older_brother.daughter.husband': '侄女婿 / nephew-in-law', 'younger_brother.daughter.husband': '侄女婿 / nephew-in-law',
+  'older_sister.son.wife': '外甥媳妇 / niece-in-law', 'younger_sister.son.wife': '外甥媳妇 / niece-in-law',
+  'older_sister.daughter.husband': '外甥女婿 / nephew-in-law', 'younger_sister.daughter.husband': '外甥女婿 / nephew-in-law',
+  'son.son.wife': '孙媳妇 / granddaughter-in-law', 'son.daughter.husband': '孙女婿 / grandson-in-law',
+  'daughter.son.wife': '外孙媳妇 / granddaughter-in-law', 'daughter.daughter.husband': '外孙女婿 / grandson-in-law',
+  'husband.older_brother.son': '夫家侄子 / nephew by marriage', 'husband.younger_brother.son': '夫家侄子 / nephew by marriage',
+  'husband.older_brother.daughter': '夫家侄女 / niece by marriage', 'husband.younger_brother.daughter': '夫家侄女 / niece by marriage',
+  'husband.older_sister.son': '夫家外甥 / nephew by marriage', 'husband.younger_sister.son': '夫家外甥 / nephew by marriage',
+  'husband.older_sister.daughter': '夫家外甥女 / niece by marriage', 'husband.younger_sister.daughter': '夫家外甥女 / niece by marriage',
+  'wife.older_brother.son': '内侄 / nephew by marriage', 'wife.younger_brother.son': '内侄 / nephew by marriage',
+  'wife.older_brother.daughter': '内侄女 / niece by marriage', 'wife.younger_brother.daughter': '内侄女 / niece by marriage',
+  'wife.older_sister.son': '妻子的外甥 / nephew by marriage', 'wife.younger_sister.son': '妻子的外甥 / nephew by marriage',
+  'wife.older_sister.daughter': '妻子的外甥女 / niece by marriage', 'wife.younger_sister.daughter': '妻子的外甥女 / niece by marriage',
+  'son.wife.father': '亲家公 / child’s father-in-law', 'son.wife.mother': '亲家母 / child’s mother-in-law',
+  'daughter.husband.father': '亲家公 / child’s father-in-law', 'daughter.husband.mother': '亲家母 / child’s mother-in-law',
+  'son.husband.father': '亲家公 / child’s father-in-law', 'son.husband.mother': '亲家母 / child’s mother-in-law',
+  'daughter.wife.father': '亲家公 / child’s father-in-law', 'daughter.wife.mother': '亲家母 / child’s mother-in-law'
+};
+
+const lpKinshipParents = ['father', 'mother'];
+const lpKinshipSpouses = ['husband', 'wife'];
+const lpKinshipChildren = ['son', 'daughter'];
+const lpKinshipSiblings = ['older_brother', 'younger_brother', 'older_sister', 'younger_sister'];
+
+function lpKinshipType(chain) {
+  const [first, second, ...rest] = chain;
+  if (!chain.length) return 'self';
+  if (chain.length === 1 && lpKinshipParents.includes(first)) return 'parent';
+  if (chain.length === 1 && lpKinshipChildren.includes(first)) return 'child';
+  if (chain.length === 1 && lpKinshipSpouses.includes(first)) return 'spouse';
+  if (chain.length === 1 && lpKinshipSiblings.includes(first)) return 'sibling';
+  if (chain.every((part) => lpKinshipParents.includes(part))) return chain.length === 2 ? 'grandparent' : 'ancestor';
+  if (chain.every((part) => lpKinshipChildren.includes(part))) return 'descendant';
+  if (lpKinshipSiblings.includes(first) && chain.slice(1).every((part) => lpKinshipChildren.includes(part))) {
+    return chain.length === 2 ? 'sibling_descendant' : 'remote_sibling_descendant';
+  }
+  if (lpKinshipParents.includes(first) && lpKinshipSiblings.includes(second)) {
+    if (!rest.length) return 'uncle_aunt';
+    if (rest.every((part) => lpKinshipChildren.includes(part))) return rest.length === 1 ? 'cousin' : 'cousin_descendant';
+  }
+  if (chain.length === 3 && lpKinshipParents.includes(first) && lpKinshipParents.includes(second) && lpKinshipSiblings.includes(rest[0])) return 'remote_collateral';
+  return 'ambiguous';
+}
+
+function lpKinshipCategory(profile, type) {
+  const tables = {
+    'cn-mainland': {
+      self: '被继承人',
+      spouse: '第一顺序法定继承人｜配偶', child: '第一顺序法定继承人｜子女', descendant: '第一顺序代位候选｜子女支系', parent: '第一顺序法定继承人｜父母',
+      sibling: '第二顺序法定继承人｜第一顺序无人时进入', sibling_descendant: '第二顺序代位候选｜兄弟姐妹先亡或丧失资格时进入',
+      remote_sibling_descendant: '无法定继承权｜侄孙辈及以下', grandparent: '第二顺序法定继承人｜第一顺序无人时进入',
+      ancestor: '无法定继承权｜曾祖辈及以上', uncle_aunt: '无法定继承权｜伯叔姑舅姨', cousin: '无法定继承权｜堂表亲',
+      cousin_descendant: '无法定继承权｜堂表亲后代', remote_collateral: '无法定继承权｜较远旁系亲属'
+    },
+    'cn-taiwan': {
+      self: '被继承人',
+      spouse: '法定继承人｜随血亲顺序共同继承', child: '第一顺序法定继承人｜直系卑亲属', descendant: '第一顺序候选｜最近亲等或代位进入',
+      parent: '第二顺序法定继承人｜第一顺序无人时进入', sibling: '第三顺序法定继承人｜前两顺序无人时进入',
+      sibling_descendant: '无法定继承权｜无兄弟姐妹代位', remote_sibling_descendant: '无法定继承权｜兄弟姐妹后代',
+      grandparent: '第四顺序法定继承人｜前三顺序无人时进入', ancestor: '无法定继承权｜曾祖辈及以上',
+      uncle_aunt: '无法定继承权｜伯叔姑舅姨', cousin: '无法定继承权｜堂表亲', cousin_descendant: '无法定继承权｜堂表亲后代',
+      remote_collateral: '无法定继承权｜较远旁系亲属'
+    },
+    'cn-hk': {
+      self: '死者',
+      spouse: '法定继承人｜生存配偶', child: '首位血亲法定继承人｜后嗣', descendant: '首位血亲代表继承候选｜后嗣支系',
+      parent: '后位法定继承人｜无后嗣时进入', sibling: '后位法定继承人｜全血／半血分别排序',
+      sibling_descendant: '后位代表继承候选｜兄弟姐妹支系', remote_sibling_descendant: '后位代表继承候选｜兄弟姐妹支系后代',
+      grandparent: '后位法定继承人｜祖父母辈', ancestor: '无法定继承权｜祖父母以上直系尊亲属',
+      uncle_aunt: '后位法定继承人｜伯叔姑舅姨支系', cousin: '后位代表继承候选｜伯叔姑舅姨支系',
+      cousin_descendant: '后位代表继承候选｜伯叔姑舅姨支系后代', remote_collateral: '无法定继承权｜伯叔姑舅姨支系以外的较远旁系'
+    },
+    'cn-macau': {
+      self: '被继承人',
+      spouse: '法定继承人｜第一至第三顺序成员', child: '第一顺序法定继承人｜直系卑亲属', descendant: '第一顺序代位继承候选｜直系卑亲属',
+      parent: '第二顺序法定继承人｜第一顺序无人时进入', grandparent: '第二顺序候选｜较近尊亲属无人时进入', ancestor: '第二顺序候选｜最近亲等直系尊亲属',
+      sibling: '第五顺序法定继承人｜前四顺序无人时进入', sibling_descendant: '第五顺序代位继承候选｜兄弟姐妹支系',
+      remote_sibling_descendant: '第五顺序代位继承候选｜兄弟姐妹支系后代', uncle_aunt: '第六顺序法定继承人｜四亲等内旁系',
+      cousin: '第六顺序法定继承人｜四亲等旁系', cousin_descendant: '无法定继承权｜超过四亲等',
+      remote_collateral: '第六顺序候选｜四亲等内旁系'
+    },
+    'jp-modern': {
+      self: '被相続人',
+      spouse: '法定相続人｜常为继承人', child: '第一順位法定相続人｜子女', descendant: '第一順位代襲继承候选｜直系卑属',
+      parent: '第二順位法定相続人｜第一順位无人时进入', grandparent: '第二順位候选｜较近直系尊属无人时进入', ancestor: '第二順位候选｜最近亲等直系尊属',
+      sibling: '第三順位法定相続人｜前两順位无人时进入', sibling_descendant: '第三順位代襲继承候选｜甥／姪',
+      remote_sibling_descendant: '无法定继承权｜甥／姪以下不再代襲', uncle_aunt: '无法定继承权｜おじ／おば',
+      cousin: '无法定继承权｜いとこ', cousin_descendant: '无法定继承权｜いとこ后代', remote_collateral: '无法定继承权｜较远旁系亲属'
+    },
+    'jp-house': {
+      self: '户主／家主',
+      spouse: '无当然承继权｜配偶', child: '家督承继候选｜家族直系卑属', descendant: '家督承继候选｜家族直系卑属代袭',
+      parent: '后位家督承继候选｜尊亲属', grandparent: '后位家督承继候选｜尊亲属', ancestor: '后位家督承继候选｜较远尊亲属',
+      sibling: '后位家督承继候选｜旁系家族', sibling_descendant: '后位家督承继候选｜旁系支系', remote_sibling_descendant: '后位家督承继候选｜较远旁系支系',
+      uncle_aunt: '家督承继候选｜旁系家族', cousin: '家督承继候选｜旁系家族', cousin_descendant: '家督承继候选｜较远旁系家族', remote_collateral: '家督承继候选｜较远旁系家族'
+    },
+    us: {
+      self: '死者',
+      spouse: '法定继承人｜生存配偶', child: '优先血亲继承人｜子女', descendant: '优先血亲代表继承候选｜后代支系',
+      parent: '后位法定继承人｜无后代时进入', sibling: '后位法定继承人｜父母的后代',
+      sibling_descendant: '后位代表继承候选｜父母的后代', remote_sibling_descendant: '后位代表继承候选｜父母的后代',
+      grandparent: '后位法定继承人｜祖父母组', ancestor: '后位血亲继承候选｜适用范围按州法',
+      uncle_aunt: '后位法定继承人｜祖父母的后代', cousin: '后位代表继承候选｜祖父母的后代',
+      cousin_descendant: '后位血亲继承候选｜适用范围按州法', remote_collateral: '后位血亲继承候选｜适用范围按州法'
+    },
+    'uk-victorian': {
+      self: '无遗嘱死者',
+      spouse: '法定继承人｜遗孀／鳏夫', child: '首位血亲继承人｜动产与不动产路线不同', descendant: '首位血亲代表继承候选｜后代支系',
+      parent: '后位血亲继承候选｜最近亲／不动产法定继承人', grandparent: '后位血亲继承候选｜最近亲／地产继嗣', ancestor: '后位血亲继承候选｜动产与不动产路线不同',
+      sibling: '后位血亲继承候选｜最近亲／旁系地产继嗣', sibling_descendant: '后位代表继承候选｜兄弟姐妹支系',
+      remote_sibling_descendant: '后位血亲继承候选｜亲等另计', uncle_aunt: '后位血亲继承候选｜最近亲／较后旁系',
+      cousin: '后位血亲继承候选｜堂表亲', cousin_descendant: '后位血亲继承候选｜亲等另计', remote_collateral: '后位血亲继承候选｜亲等另计'
+    }
+  };
+  return tables[profile]?.[type] || '身份待确定｜当前法律包未归类';
+}
+
+function lpPackKinshipCategory(lawPack, type, chain = []) {
+  const profile = lawPack.meta.kinshipProfile || 'cn-mainland';
+  const id = lawPack.meta.id;
+  const base = lpKinshipCategory(profile, type);
+
+  if (id === 'jp-showa-1948-1980' && type === 'remote_sibling_descendant') {
+    return '第三順位代襲继承候选｜兄弟姐妹支系可连续代襲';
+  }
+
+  if (profile === 'cn-macau') {
+    if (type === 'remote_collateral') return '第六顺序法定继承人｜四亲等旁系';
+    if (type === 'cousin_descendant') return '无法定继承权｜超过四亲等';
+  }
+
+  if (profile !== 'us') return base;
+
+  const laterBlood = '后位法定继承候选｜前序亲属无人时进入';
+  const noBloodRight = '无法定继承权｜不在该州无遗嘱继承亲属范围内';
+  const broadNextOfKinStates = new Set([
+    'us-ma-current', 'us-ct-current', 'us-vt-current', 'us-ca-current', 'us-ri-current'
+  ]);
+  const remoteTypes = new Set(['ancestor', 'remote_sibling_descendant', 'cousin_descendant', 'remote_collateral']);
+
+  if (broadNextOfKinStates.has(id) && remoteTypes.has(type)) return laterBlood;
+
+  if (id === 'us-me-current') {
+    if (type === 'ancestor' && chain.length > 3) return noBloodRight;
+    if (remoteTypes.has(type)) return laterBlood;
+  }
+
+  if (id === 'us-nh-current') {
+    if (type === 'remote_sibling_descendant') return chain.length <= 3 ? laterBlood : noBloodRight;
+    if (type === 'cousin_descendant' || type === 'remote_collateral' || type === 'ancestor') return noBloodRight;
+  }
+
+  if (id === 'us-ny-current') {
+    if (type === 'remote_sibling_descendant' || type === 'cousin_descendant') return laterBlood;
+    if (type === 'remote_collateral' || type === 'ancestor') return noBloodRight;
+  }
+
+  if (id.endsWith('-1920s') && remoteTypes.has(type)) {
+    return '后位血亲继承候选｜具体顺位按死亡年份使用';
+  }
+
+  return base;
+}
+
+function lpPackStepchildCategory(lawPack) {
+  if (lawPack.meta.id === 'us-ct-current') return '后位法定继承候选｜无近亲时进入';
+  if (['us-ca-current', 'us-me-current'].includes(lawPack.meta.id)) {
+    return '后位法定继承候选｜亡故配偶的后代';
+  }
+  if (lawPack.meta.id.endsWith('-1920s')) return '资格依个案确定｜继子女';
+  return '无法定继承权｜仅有继亲关系';
+}
+
+function lpResolveKinship(chain) {
+  const type = lpKinshipType(chain);
+  if (chain.length >= 3 && lpKinshipSpouses.includes(chain.at(-1)) && chain.slice(0, -1).every((part) => lpKinshipParents.includes(part))) {
+    return {
+      type: 'ancestor_or_stepancestor',
+      bloodType: chain.length === 3 ? 'grandparent' : 'ancestor',
+      generation: chain.length - 1,
+      sex: chain.at(-1) === 'husband' ? 'male' : 'female'
+    };
+  }
+  if (chain.length === 3 && chain.slice(0, 2).every((part) => lpKinshipParents.includes(part)) && lpKinshipChildren.includes(chain[2])) {
+    if ((chain[0] === 'father' && chain[2] === 'daughter') || (chain[0] === 'mother' && chain[2] === 'son')) return { type: 'uncle_aunt' };
+    return {
+      type: 'parent_or_uncle_aunt',
+      parentSex: chain[0] === 'father' ? 'male' : 'female',
+      sex: chain[2] === 'son' ? 'male' : 'female'
+    };
+  }
+  if (chain.length === 2) {
+    const [first, second] = chain;
+    if (lpKinshipParents.includes(first) && lpKinshipSpouses.includes(second)) return { type: 'parent_or_stepparent', sex: second === 'husband' ? 'male' : 'female' };
+    if (lpKinshipSpouses.includes(first) && lpKinshipChildren.includes(second)) return { type: 'child_or_stepchild', sex: second === 'son' ? 'male' : 'female' };
+    if (lpKinshipSpouses.includes(first) && lpKinshipParents.includes(second)) return { type: 'parent_in_law', sex: second === 'father' ? 'male' : 'female' };
+    if (lpKinshipChildren.includes(first) && lpKinshipSpouses.includes(second)) return { type: 'child_in_law', sex: second === 'husband' ? 'male' : 'female' };
+    if ((lpKinshipSiblings.includes(first) && lpKinshipSpouses.includes(second)) || (lpKinshipSpouses.includes(first) && lpKinshipSiblings.includes(second))) {
+      const male = lpKinshipSpouses.includes(second)
+        ? second === 'husband'
+        : ['older_brother', 'younger_brother'].includes(second);
+      return { type: 'sibling_in_law', sex: male ? 'male' : 'female' };
+    }
+    if (lpKinshipParents.includes(first) && lpKinshipChildren.includes(second)) return { type: 'self_or_sibling', sex: second === 'son' ? 'male' : 'female' };
+    if (lpKinshipChildren.includes(first) && lpKinshipParents.includes(second)) return { type: 'self_or_coparent', sex: second === 'father' ? 'male' : 'female' };
+    if (lpKinshipSiblings.includes(first) && lpKinshipParents.includes(second)) return { type: 'parent_or_half_sibling_parent', sex: second === 'father' ? 'male' : 'female' };
+    if (lpKinshipSpouses.includes(first) && lpKinshipSpouses.includes(second)) return { type: 'self_or_cospouse', sex: second === 'husband' ? 'male' : 'female' };
+    if (lpKinshipSiblings.includes(first) && lpKinshipSiblings.includes(second)) return { type: 'self_or_sibling_peer', sex: ['older_brother', 'younger_brother'].includes(second) ? 'male' : 'female' };
+    if (lpKinshipChildren.includes(first) && lpKinshipSiblings.includes(second)) return { type: 'child_or_child_sibling', sex: ['older_brother', 'younger_brother'].includes(second) ? 'male' : 'female' };
+  }
+  if (type !== 'ambiguous') return { type };
+  if (chain.some((part) => lpKinshipSpouses.includes(part))) return { type: 'complex_affinal' };
+  const generation = chain.reduce((sum, part) => sum + (lpKinshipParents.includes(part) ? 1 : lpKinshipChildren.includes(part) ? -1 : 0), 0);
+  if (generation > 0) return { type: 'complex_ancestor' };
+  if (generation < 0) return { type: 'complex_descendant' };
+  return { type: 'complex_collateral' };
+}
+
+function lpSpecialKinshipName(style, resolution) {
+  const sex = resolution.sex;
+  const generationName = resolution.generation === 2
+    ? { cn: '祖', jp: '祖', en: 'grand' }
+    : { cn: '曾祖', jp: '曽祖', en: 'great-grand' };
+  const names = {
+    ancestor_or_stepancestor: {
+      cn: `${generationName.cn}${sex === 'male' ? '父' : '母'}或继${generationName.cn}${sex === 'male' ? '父' : '母'}`,
+      jp: `${generationName.jp}${sex === 'male' ? '父' : '母'}または継${generationName.jp}${sex === 'male' ? '父' : '母'}`,
+      en: `${generationName.cn}${sex === 'male' ? '父' : '母'}或继${generationName.cn}${sex === 'male' ? '父' : '母'} / ${generationName.en}${sex === 'male' ? 'father' : 'mother'} or step-${generationName.en}${sex === 'male' ? 'father' : 'mother'}`
+    },
+    parent_or_uncle_aunt: {
+      cn: resolution.parentSex === 'male' ? '父亲或伯叔父' : '母亲或姨母',
+      jp: resolution.parentSex === 'male' ? '父または父方のおじ' : '母または母方のおば',
+      en: resolution.parentSex === 'male' ? '父亲或伯叔父 / father or paternal uncle' : '母亲或姨母 / mother or maternal aunt'
+    },
+    parent_or_stepparent: {
+      cn: sex === 'male' ? '父亲或继父' : '母亲或继母',
+      jp: sex === 'male' ? '父／継父（ちち／ままちち）' : '母／継母（はは／ままはは）',
+      en: sex === 'male' ? '父亲或继父 / father or stepfather' : '母亲或继母 / mother or stepmother'
+    },
+    child_or_stepchild: {
+      cn: sex === 'male' ? '儿子或继子' : '女儿或继女',
+      jp: sex === 'male' ? '息子／継子（むすこ／ままこ）' : '娘／継子（むすめ／ままこ）',
+      en: sex === 'male' ? '儿子或继子 / son or stepson' : '女儿或继女 / daughter or stepdaughter'
+    },
+    parent_in_law: {
+      cn: sex === 'male' ? '姻亲父亲' : '姻亲母亲',
+      jp: sex === 'male' ? '義父（ぎふ）' : '義母（ぎぼ）',
+      en: sex === 'male' ? '岳父／公公 / father-in-law' : '岳母／婆婆 / mother-in-law'
+    },
+    child_in_law: {
+      cn: sex === 'male' ? '女婿' : '儿媳',
+      jp: sex === 'male' ? '娘婿（むすめむこ）' : '嫁（よめ）',
+      en: sex === 'male' ? '女婿 / son-in-law' : '儿媳 / daughter-in-law'
+    },
+    sibling_in_law: {
+      cn: sex === 'male' ? '姻亲兄弟' : '姻亲姐妹',
+      jp: sex === 'male' ? '義兄弟（ぎきょうだい）' : '義姉妹（ぎしまい）',
+      en: sex === 'male' ? '姻亲兄弟 / brother-in-law' : '姻亲姐妹 / sister-in-law'
+    },
+    self_or_sibling: {
+      cn: sex === 'male' ? '本人或兄弟' : '本人或姐妹',
+      jp: sex === 'male' ? '本人または兄弟' : '本人または姉妹',
+      en: sex === 'male' ? '本人或兄弟 / self or brother' : '本人或姐妹 / self or sister'
+    },
+    self_or_coparent: {
+      cn: sex === 'male' ? '本人或子女的父亲' : '本人或子女的母亲',
+      jp: sex === 'male' ? '本人または子の父' : '本人または子の母',
+      en: sex === 'male' ? '本人或子女的父亲 / self or child’s father' : '本人或子女的母亲 / self or child’s mother'
+    },
+    parent_or_half_sibling_parent: {
+      cn: sex === 'male' ? '父亲或半血兄弟姐妹的父亲' : '母亲或半血兄弟姐妹的母亲',
+      jp: sex === 'male' ? '父または半血兄弟姉妹の父' : '母または半血兄弟姉妹の母',
+      en: sex === 'male' ? '父亲或半血兄弟姐妹的父亲 / father or half-sibling’s father' : '母亲或半血兄弟姐妹的母亲 / mother or half-sibling’s mother'
+    },
+    self_or_cospouse: {
+      cn: sex === 'male' ? '本人或配偶的其他丈夫' : '本人或配偶的其他妻子',
+      jp: sex === 'male' ? '本人または配偶の別の夫' : '本人または配偶の別の妻',
+      en: sex === 'male' ? '本人或配偶的其他丈夫 / self or spouse’s other husband' : '本人或配偶的其他妻子 / self or spouse’s other wife'
+    },
+    self_or_sibling_peer: {
+      cn: sex === 'male' ? '本人或另一位兄弟' : '本人或另一位姐妹',
+      jp: sex === 'male' ? '本人または別の兄弟' : '本人または別の姉妹',
+      en: sex === 'male' ? '本人或另一位兄弟 / self or another brother' : '本人或另一位姐妹 / self or another sister'
+    },
+    child_or_child_sibling: {
+      cn: sex === 'male' ? '另一名儿子或该子女的半兄弟' : '另一名女儿或该子女的半姐妹',
+      jp: sex === 'male' ? '別の息子または子の半血兄弟' : '別の娘または子の半血姉妹',
+      en: sex === 'male' ? '另一名儿子或该子女的半兄弟 / another son or child’s half-brother' : '另一名女儿或该子女的半姐妹 / another daughter or child’s half-sister'
+    }
+  };
+  return names[resolution.type]?.[style] || null;
+}
+
+function lpSpecialKinshipClassification(lawPack, resolution, chain) {
+  const parentClass = lpPackKinshipCategory(lawPack, 'parent', ['father']);
+  const childClass = lpPackKinshipCategory(lawPack, 'child', ['son']);
+  const siblingClass = lpPackKinshipCategory(lawPack, 'sibling', ['older_brother']);
+  const packName = lawPack.meta.menuLabel;
+  if (resolution.type === 'ancestor_or_stepancestor') {
+    const ancestorClass = lpPackKinshipCategory(lawPack, resolution.bloodType, chain.slice(0, -1));
+    return {
+      category: '身份可能不同｜祖辈或继祖辈',
+      note: `法律上的直系祖辈使用“${ancestorClass}”；仅为祖辈的配偶时无法定血亲继承权。`
+    };
+  }
+  if (resolution.type === 'parent_or_uncle_aunt') {
+    const uncleClass = lpPackKinshipCategory(lawPack, 'uncle_aunt', chain);
+    return {
+      category: '身份可能不同｜父母或父母的手足',
+      note: `死者父母本人使用“${parentClass}”；父母的手足使用“${uncleClass}”。`
+    };
+  }
+  if (resolution.type === 'parent_or_stepparent') return {
+    category: '身份可能不同｜父母或继父母',
+    note: `法律上的父母使用“${parentClass}”；仅为父母的配偶时无法定血亲继承权。`
+  };
+  if (resolution.type === 'child_or_stepchild') return {
+    category: '身份可能不同｜子女或继子女',
+    note: `存在法律亲子关系时使用“${childClass}”；仅为配偶的子女时使用“${lpPackStepchildCategory(lawPack)}”。`
+  };
+  if (['parent_in_law', 'child_in_law', 'sibling_in_law', 'complex_affinal'].includes(resolution.type)) return {
+    category: '无法定继承权｜姻亲',
+    note: `仅有婚姻关系时不进入“${packName}”的血亲继承顺位；另有收养、亲子或家成员身份时使用相应身份。`
+  };
+  if (resolution.type === 'self_or_sibling') return {
+    category: '身份可能不同｜本人或兄弟姐妹',
+    note: `“父母的子女”包括死者本人及“${siblingClass}”。`
+  };
+  if (resolution.type === 'self_or_coparent') return {
+    category: '身份可能不同｜本人或子女的另一位父母',
+    note: '“子女的父母”可能是死者本人；另一位父母仅在同时具有配偶或其他法定身份时进入继承顺位。'
+  };
+  if (resolution.type === 'parent_or_half_sibling_parent') return {
+    category: '身份可能不同｜父母候选',
+    note: `与死者及该兄弟姐妹共有亲子关系时使用“${parentClass}”；仅为半血兄弟姐妹的另一位父母时，不是死者的父母。`
+  };
+  if (resolution.type === 'self_or_cospouse') return {
+    category: '身份可能不同｜本人或共同配偶关系',
+    note: '配偶的配偶可能是死者本人，也可能是另一名配偶；具体身份由人物关系确定。'
+  };
+  if (resolution.type === 'self_or_sibling_peer') return {
+    category: '身份可能不同｜本人或另一位兄弟姐妹',
+    note: `“兄弟姐妹的兄弟姐妹”包括死者本人及“${siblingClass}”。`
+  };
+  if (resolution.type === 'child_or_child_sibling') return {
+    category: '身份可能不同｜子女或子女的半血手足',
+    note: `与死者存在法律亲子关系时使用“${childClass}”；仅与该子女共有另一位父母时，不是死者的子女。`
+  };
+  if (resolution.type === 'complex_ancestor') return {
+    category: '身份待确定｜较远祖辈或旁系',
+    note: '连续向父母追溯时属于直系祖辈；途中转向兄弟姐妹后则成为旁系亲属，具体类别按共同祖先与世代确定。'
+  };
+  if (resolution.type === 'complex_descendant') return {
+    category: '身份待确定｜较远后代或旁系后代',
+    note: '连续向子女延伸时属于直系后代；途中转向兄弟姐妹后则成为旁系后代，适用顺位可能不同。'
+  };
+  if (resolution.type === 'complex_collateral') return {
+    category: '身份待确定｜多步旁系亲属',
+    note: `该关系不是直系亲属；使用共同祖先与相隔世代对应“${packName}”的旁系类别。`
+  };
+  return null;
+}
+
+const lpKinshipWordsEn = {
+  father: 'father', mother: 'mother', husband: 'husband', wife: 'wife', older_brother: 'older brother', younger_brother: 'younger brother',
+  older_sister: 'older sister', younger_sister: 'younger sister', son: 'son', daughter: 'daughter'
+};
+const lpKinshipWordsJp = {
+  father: '父（ちち）', mother: '母（はは）', husband: '夫（おっと）', wife: '妻（つま）', older_brother: '兄（あに）', younger_brother: '弟（おとうと）',
+  older_sister: '姉（あね）', younger_sister: '妹（いもうと）', son: '息子（むすこ）', daughter: '娘（むすめ）'
+};
+
+function lpLinealKinshipName(style, chain) {
+  const upward = chain.every((part) => lpKinshipParents.includes(part));
+  const downward = chain.every((part) => lpKinshipChildren.includes(part));
+  if ((!upward && !downward) || chain.length < 3) return null;
+  const male = chain.at(-1) === (upward ? 'father' : 'son');
+  if (upward) {
+    const outsideMaleLine = chain.slice(0, -1).some((part) => part === 'mother');
+    const cn = chain.length === 3
+      ? `${outsideMaleLine ? '外' : ''}曾祖${male ? '父' : '母'}`
+      : `${outsideMaleLine ? '外' : ''}高祖${male ? '父' : '母'}`;
+    if (style === 'cn') return cn;
+    if (style === 'jp') return chain.length === 3 ? `曽祖${male ? '父（そうそふ）' : '母（そうそぼ）'}` : `高祖${male ? '父（こうそふ）' : '母（こうそぼ）'}`;
+    const english = `${chain.length === 4 ? 'great-' : ''}great-grand${male ? 'father' : 'mother'}`;
+    return `${cn} / ${english}`;
+  }
+  const outsideMaleLine = chain.slice(0, -1).some((part) => part === 'daughter');
+  const cn = chain.length === 3
+    ? `${outsideMaleLine ? '外' : ''}曾孙${male ? '' : '女'}`
+    : `${outsideMaleLine ? '外' : ''}玄孙${male ? '' : '女'}`;
+  if (style === 'cn') return cn;
+  if (style === 'jp') return chain.length === 3 ? '曽孫（ひまご）' : '玄孫（やしゃご）';
+  const english = `${chain.length === 4 ? 'great-' : ''}great-grand${male ? 'son' : 'daughter'}`;
+  return `${cn} / ${english}`;
+}
+
+function lpSiblingBranchKinshipName(style, chain) {
+  if (!lpKinshipSiblings.includes(chain[0]) || !chain.slice(1).every((part) => lpKinshipChildren.includes(part))) return null;
+  const depth = chain.length - 1;
+  const lastMale = chain.at(-1) === 'son';
+  const siblingMale = ['older_brother', 'younger_brother'].includes(chain[0]);
+  const firstChildMale = chain[1] === 'son';
+  if (depth === 1) return null;
+  if (style === 'en') {
+    const cnName = lpSiblingBranchKinshipName('cn', chain);
+    const prefix = depth === 2 ? 'great-' : 'great-great-';
+    return `${cnName} / ${prefix}${lastMale ? 'nephew' : 'niece'}`;
+  }
+  if (style === 'jp') {
+    const root = firstChildMale ? '甥（おい）' : '姪（めい）';
+    const tail = depth === 2 ? (lastMale ? '息子' : '娘') : '孫';
+    return `${root}の${tail}`;
+  }
+  if (siblingMale && firstChildMale) return `侄${depth === 2 ? '孙' : '曾孙'}${lastMale ? '' : '女'}`;
+  if (!siblingMale && firstChildMale) return `外甥${depth === 2 ? '孙' : '曾孙'}${lastMale ? '' : '女'}`;
+  const root = siblingMale ? '侄女' : '外甥女';
+  return `${root}的${depth === 2 ? (lastMale ? '儿子' : '女儿') : (lastMale ? '孙子' : '孙女')}`;
+}
+
+function lpCousinBranchKinshipName(style, chain) {
+  if (!lpKinshipParents.includes(chain[0]) || !lpKinshipSiblings.includes(chain[1]) || !chain.slice(2).every((part) => lpKinshipChildren.includes(part))) return null;
+  const paternalBrother = chain[0] === 'father' && ['older_brother', 'younger_brother'].includes(chain[1]);
+  const lastMale = chain.at(-1) === 'son';
+  if (chain.length === 3) {
+    if (style === 'jp') return lastMale ? 'いとこ（従兄弟）' : 'いとこ（従姉妹）';
+    if (style === 'en') return `${paternalBrother ? '堂' : '表'}${lastMale ? '兄弟' : '姐妹'} / first cousin`;
+    return `${paternalBrother ? '堂' : '表'}${lastMale ? '兄弟' : '姐妹'}`;
+  }
+  if (style === 'jp') return `いとこの${lastMale ? '息子' : '娘'}`;
+  if (style === 'en') return `${paternalBrother ? '堂' : '表'}亲的${lastMale ? '儿子' : '女儿'} / first cousin once removed`;
+  const variants = paternalBrother
+    ? (lastMale ? '堂侄／堂外甥' : '堂侄女／堂外甥女')
+    : (lastMale ? '表侄／表外甥' : '表侄女／表外甥女');
+  return `${paternalBrother ? '堂' : '表'}亲的${lastMale ? '儿子' : '女儿'}（${variants}）`;
+}
+
+function lpGrandparentSiblingKinshipName(style, chain) {
+  if (chain.length < 3 || !lpKinshipParents.includes(chain[0]) || !lpKinshipParents.includes(chain[1]) || !lpKinshipSiblings.includes(chain[2])) return null;
+  const siblingMale = ['older_brother', 'younger_brother'].includes(chain[2]);
+  const spouse = chain[3];
+  if (spouse && !lpKinshipSpouses.includes(spouse)) return null;
+  if (spouse && ((siblingMale && spouse !== 'wife') || (!siblingMale && spouse !== 'husband'))) return null;
+  const resultingMale = spouse ? !siblingMale : siblingMale;
+  if (style === 'jp') return resultingMale ? '大おじ（おおおじ）' : '大おば（おおおば）';
+  if (style === 'en') return `${lpGrandparentSiblingKinshipName('cn', chain)} / great-${resultingMale ? 'uncle' : 'aunt'}${spouse ? ' by marriage' : ''}`;
+  const branch = `${chain[0]}.${chain[1]}`;
+  const older = ['older_brother', 'older_sister'].includes(chain[2]);
+  const roots = {
+    'father.father': siblingMale ? (older ? '伯祖' : '叔祖') : '姑祖',
+    'father.mother': siblingMale ? '舅祖' : '姨祖',
+    'mother.father': siblingMale ? (older ? '外伯祖' : '外叔祖') : '外姑祖',
+    'mother.mother': siblingMale ? '外舅祖' : '外姨祖'
+  };
+  return `${roots[branch]}${resultingMale ? '父' : '母'}`;
+}
+
+function lpComposedKinshipName(style, chain) {
+  if (!chain.length) return style === 'jp' ? '被相続人本人' : style === 'en' ? '死者本人 / self' : '死者本人';
+  const cn = chain.map((item) => lpKinshipLabelsCn[item]).join('的');
+  if (style === 'cn') return cn;
+  if (style === 'jp') return chain.map((item) => lpKinshipWordsJp[item]).join('の');
+  const english = chain.map((item) => lpKinshipWordsEn[item]).join('’s ');
+  return `${cn} / ${english}`;
+}
+
+function lpFallbackKinshipName(style, chain) {
+  return lpLinealKinshipName(style, chain)
+    || lpSiblingBranchKinshipName(style, chain)
+    || lpCousinBranchKinshipName(style, chain)
+    || lpGrandparentSiblingKinshipName(style, chain)
+    || lpComposedKinshipName(style, chain);
+}
+
+function getKinshipView(lawPack, chain) {
+  const profile = lawPack.meta.kinshipProfile || 'cn-mainland';
+  const style = profile.startsWith('jp-') ? 'jp' : ['us', 'uk-victorian'].includes(profile) ? 'en' : 'cn';
+  const labels = style === 'jp' ? lpKinshipLabelsJp : style === 'en' ? lpKinshipLabelsEn : lpKinshipLabelsCn;
+  const names = style === 'jp' ? lpKinshipNamesJp : style === 'en' ? lpKinshipNamesEn : lpKinshipNamesCn;
+  const key = chain.join('.');
+  const resolution = lpResolveKinship(chain);
+  const fallback = lpSpecialKinshipName(style, resolution) || lpFallbackKinshipName(style, chain);
+  const specialClassification = lpSpecialKinshipClassification(lawPack, resolution, chain);
+  return {
+    labels,
+    name: names[key] || fallback,
+    classification: {
+      category: specialClassification?.category || lpPackKinshipCategory(lawPack, resolution.type, chain),
+      note: specialClassification?.note || `使用“${lawPack.meta.menuLabel}”的分类；拟制亲属、半血缘与收养身份使用人物资料中的选项。`
+    }
+  };
+}
+
+// Registry ------------------------------------------------------------------
+
+const lawCountries = [
+  { id: 'china', label: '中国' },
+  { id: 'japan', label: '日本' },
+  { id: 'us', label: '美国' },
+  { id: 'uk', label: '英国' }
+];
+
+const lawPackList = [
+  cnMainland2021,
+  lpChinaTaiwanCurrent,
+  lpChinaHongKongCurrent,
+  lpChinaMacauCurrent,
+  lpChinaRoc1931,
+  lpJapanCurrent,
+  lpJapanReform1981,
+  lpJapanPostwar,
+  lpJapanEarlyShowa,
+  lpJapanTaisho,
+  lpJapanEdo,
+  lpJapanSengoku,
+  lpMassachusettsCurrent,
+  lpRhodeIslandCurrent,
+  lpNewYorkCurrent,
+  lpConnecticutCurrent,
+  lpMaineCurrent,
+  lpNewHampshireCurrent,
+  lpVermontCurrent,
+  lpCaliforniaCurrent,
+  lpMassachusetts1920,
+  lpRhodeIsland1920,
+  lpNewYork1920,
+  lpVictorian1890
+];
+
+const lawPackRegistry = Object.fromEntries(lawPackList.map((pack) => [pack.meta.id, pack]));
 
 
 
@@ -487,71 +2345,98 @@ function analyzeEventSequence(caseData, lawPack, events) {
 
 
 
-const STORAGE_KEY = 'inheritance-simulator.case.v2';
-const lawPacks = { [cnMainland2021.meta.id]: cnMainland2021 };
+const STORAGE_KEY = 'inheritance-simulator.case.v3';
+const LEGACY_STORAGE_KEYS = ['inheritance-simulator.case.v2'];
 const makeId = () => globalThis.crypto?.randomUUID?.() || `case-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const currencies = {
   CNY: { symbol: '¥', label: '人民币' },
+  TWD: { symbol: 'NT$', label: '新台币' },
+  HKD: { symbol: 'HK$', label: '港币' },
+  MOP: { symbol: 'MOP$', label: '澳门元' },
   USD: { symbol: '$', label: '美元' },
   GBP: { symbol: '£', label: '英镑' },
   EUR: { symbol: '€', label: '欧元' },
   JPY: { symbol: 'JP¥', label: '日元', digits: 0 },
   KRW: { symbol: '₩', label: '韩元', digits: 0 }
 };
-
-const relationOptions = [
-  ['spouse', '配偶｜第一顺序'],
-  ['child', '子女｜第一顺序'],
-  ['parent', '父母｜第一顺序'],
-  ['descendant', '子女的直系晚辈｜代位关系'],
-  ['sibling', '兄弟姐妹｜第二顺序'],
-  ['sibling_child', '兄弟姐妹的子女｜代位关系'],
-  ['paternal_grandparent', '祖父母｜第二顺序'],
-  ['maternal_grandparent', '外祖父母｜第二顺序']
+const assetDefinitions = [
+  { key: 'personalChattels', label: '个人生活动产', hint: '家具、衣物、车辆等；香港法律包会单列' },
+  { key: 'personalMovable', label: '个人其他动产', hint: '现金、存款、证券、物品' },
+  { key: 'personalImmovable', label: '个人不动产', hint: '土地、房屋、庄园' },
+  { key: 'communityMovable', label: '共同财产·动产', hint: '填写共同财产总值，再按死者份额切入' },
+  { key: 'communityImmovable', label: '共同财产·不动产', hint: '填写共同不动产总值，再按死者份额切入' }
 ];
+const stormEventLabels = { death: '死亡', disqualified: '丧失继承权', renounced: '放弃继承权' };
+const plainNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
 
-const groups = [
-  { title: '第一顺序', relations: ['spouse', 'child', 'parent'] },
-  { title: '子女支系 · 代位候选', relations: ['descendant'] },
-  { title: '第二顺序', relations: ['sibling', 'paternal_grandparent', 'maternal_grandparent'] },
-  { title: '兄弟姐妹支系 · 代位候选', relations: ['sibling_child'] }
-];
-const stormEventLabels = {
-  death: '死亡',
-  disqualified: '丧失继承权',
-  renounced: '放弃继承权'
-};
-
+const emptyAssets = () => Object.fromEntries(assetDefinitions.map(({ key }) => [key, { enabled: false, amount: 0 }]));
 const emptyCase = () => ({
-  id: makeId(),
-  lawPackId: 'cn-mainland-2021',
-  updatedAt: new Date().toISOString(),
-  currency: 'CNY',
-  decedent: { name: '', estate: 0 },
-  people: []
+  id: makeId(), lawPackId: 'cn-mainland-2021', updatedAt: new Date().toISOString(), currency: 'CNY',
+  estateMode: 'simple', communitySharePercent: 50, assets: emptyAssets(),
+  decedent: { name: '', sex: 'male', estate: 0 }, people: []
 });
+
+function migrateCase(raw) {
+  const base = emptyCase();
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const selectedPack = lawPackRegistry[source.lawPackId] || lawPackRegistry[base.lawPackId];
+  const decedent = { ...base.decedent, ...(source.decedent || {}) };
+  decedent.sex = decedent.sex === 'female' ? 'female' : 'male';
+  return {
+    ...base,
+    ...source,
+    id: source.id || makeId(),
+    lawPackId: selectedPack.meta.id,
+    currency: currencies[source.currency] ? source.currency : selectedPack.meta.defaultCurrency,
+    estateMode: source.estateMode === 'detailed' ? 'detailed' : 'simple',
+    communitySharePercent: Number.isFinite(Number(source.communitySharePercent)) ? Number(source.communitySharePercent) : 50,
+    decedent,
+    assets: Object.fromEntries(assetDefinitions.map(({ key }) => [key, {
+      ...base.assets[key], ...(source.assets?.[key] || {})
+    }])),
+    people: Array.isArray(source.people) ? source.people.map((person) => ({ ...person, attributes: person.attributes || {} })) : []
+  };
+}
 
 function loadLocalCase() {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : emptyCase();
-  } catch {
-    return emptyCase();
-  }
+    const current = localStorage.getItem(STORAGE_KEY);
+    if (current) return migrateCase(JSON.parse(current));
+    for (const key of LEGACY_STORAGE_KEYS) {
+      const legacy = localStorage.getItem(key);
+      if (legacy) return migrateCase(JSON.parse(legacy));
+    }
+  } catch { /* Start a clean local case when stored JSON is damaged. */ }
+  return emptyCase();
 }
 
 let caseData = loadLocalCase();
-if (!currencies[caseData.currency]) caseData.currency = 'CNY';
+let solverSolutions = [];
+let stormEvents = [];
+let kinshipChain = [];
 
 const elements = {
   decedentName: document.querySelector('#decedentName'),
+  decedentSex: document.querySelector('#decedentSex'),
   estateAmount: document.querySelector('#estateAmount'),
+  simpleEstate: document.querySelector('#simpleEstate'),
+  detailedEstate: document.querySelector('#detailedEstate'),
+  detailedEstateToggle: document.querySelector('#detailedEstateToggle'),
+  communitySharePercent: document.querySelector('#communitySharePercent'),
+  detailedEstateTotal: document.querySelector('#detailedEstateTotal'),
   peopleList: document.querySelector('#peopleList'),
   emptyPeople: document.querySelector('#emptyPeople'),
   results: document.querySelector('#results'),
   resultSubtitle: document.querySelector('#resultSubtitle'),
   scenarioTitle: document.querySelector('#scenarioTitle'),
   savedState: document.querySelector('#savedState'),
+  countrySelect: document.querySelector('#countrySelect'),
+  lawPack: document.querySelector('#lawPack'),
+  lawFlag: document.querySelector('#lawFlag'),
+  lawTitle: document.querySelector('#lawTitle'),
+  lawEffective: document.querySelector('#lawEffective'),
+  lawScope: document.querySelector('#lawScope'),
+  lawOmissions: document.querySelector('#lawOmissions'),
   personDialog: document.querySelector('#personDialog'),
   personForm: document.querySelector('#personForm'),
   personName: document.querySelector('#personName'),
@@ -559,17 +2444,22 @@ const elements = {
   personParent: document.querySelector('#personParent'),
   personStatus: document.querySelector('#personStatus'),
   parentField: document.querySelector('#parentField'),
+  parentHelp: document.querySelector('#parentHelp'),
+  personDynamicFields: document.querySelector('#personDynamicFields'),
   importInput: document.querySelector('#importInput'),
   solverTarget: document.querySelector('#solverTarget'),
   solverAmount: document.querySelector('#solverAmount'),
   solverResults: document.querySelector('#solverResults'),
   currencySelect: document.querySelector('#currencySelect'),
+  detailedCurrencySelect: document.querySelector('#detailedCurrencySelect'),
   estateCurrencySymbol: document.querySelector('#estateCurrencySymbol'),
   solverCurrencySymbol: document.querySelector('#solverCurrencySymbol'),
   kinshipDialog: document.querySelector('#kinshipDialog'),
   kinshipPath: document.querySelector('#kinshipPath'),
   kinshipResult: document.querySelector('#kinshipResult'),
   kinshipCategory: document.querySelector('#kinshipCategory'),
+  kinshipLaw: document.querySelector('#kinshipLaw'),
+  kinshipButtons: document.querySelector('#kinshipButtons'),
   stormDialog: document.querySelector('#stormDialog'),
   stormPerson: document.querySelector('#stormPerson'),
   stormEventType: document.querySelector('#stormEventType'),
@@ -579,30 +2469,25 @@ const elements = {
   addStormEvent: document.querySelector('#addStormEvent')
 };
 
-let solverSolutions = [];
-let stormEvents = [];
-
-const plainNumber = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
+const currentPack = () => lawPackRegistry[caseData.lawPackId] || lawPackList[0];
 
 function formatMoney(amount) {
   const code = currencies[caseData.currency] ? caseData.currency : 'CNY';
   const digits = currencies[code].digits ?? 2;
   return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: code,
-    currencyDisplay: 'narrowSymbol',
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits
-  }).format(amount);
+    style: 'currency', currency: code, currencyDisplay: 'narrowSymbol',
+    minimumFractionDigits: digits, maximumFractionDigits: digits
+  }).format(Number(amount) || 0);
 }
 
 function escapeHtml(value = '') {
   return String(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+}
+
+function parseAmount(raw) {
+  return Number(String(raw).replaceAll(',', '').replaceAll('，', '').trim());
 }
 
 function save() {
@@ -619,54 +2504,101 @@ function commit() {
   render();
 }
 
+function renderLawControls() {
+  const pack = currentPack();
+  elements.countrySelect.innerHTML = lawCountries
+    .map((country) => `<option value="${country.id}">${country.label}</option>`).join('');
+  elements.countrySelect.value = pack.meta.country;
+  const packs = lawPackList.filter((candidate) => candidate.meta.country === pack.meta.country);
+  const groups = [...new Set(packs.map((candidate) => candidate.meta.menuGroup))];
+  elements.lawPack.innerHTML = groups.map((group) => {
+    const options = packs.filter((candidate) => candidate.meta.menuGroup === group)
+      .map((candidate) => `<option value="${candidate.meta.id}">${escapeHtml(candidate.meta.menuLabel)}</option>`).join('');
+    return `<optgroup label="${escapeHtml(group)}">${options}</optgroup>`;
+  }).join('');
+  elements.lawPack.value = pack.meta.id;
+  elements.lawFlag.textContent = pack.meta.flag;
+  elements.lawTitle.textContent = pack.meta.shortTitle;
+  elements.lawEffective.textContent = pack.meta.effectiveLabel;
+  elements.lawScope.textContent = pack.meta.scope;
+  elements.lawOmissions.textContent = pack.meta.omissions;
+}
+
+function renderEstateEditor() {
+  const detailed = caseData.estateMode === 'detailed';
+  elements.detailedEstateToggle.checked = detailed;
+  elements.simpleEstate.hidden = detailed;
+  elements.detailedEstate.hidden = !detailed;
+  elements.estateAmount.value = caseData.decedent.estate ? plainNumber.format(caseData.decedent.estate) : '';
+  elements.communitySharePercent.value = caseData.communitySharePercent;
+  document.querySelectorAll('[data-asset-key]').forEach((row) => {
+    const asset = caseData.assets[row.dataset.assetKey];
+    const checkbox = row.querySelector('.asset-enabled');
+    const input = row.querySelector('.asset-amount');
+    checkbox.checked = !!asset.enabled;
+    input.disabled = !asset.enabled;
+    input.value = asset.amount ? plainNumber.format(asset.amount) : '';
+  });
+  if (detailed) {
+    const result = calculateInheritance(caseData, currentPack());
+    elements.detailedEstateTotal.textContent = formatMoney(result.estate);
+  }
+}
+
 function ancestorPath(person) {
   if (!person.parentId) return '';
   const parent = caseData.people.find((candidate) => candidate.id === person.parentId);
   return parent ? ` · ${parent.name}支系` : ' · 未找到上级人物';
 }
 
-function relationLabel(person) {
-  return `${cnMainland2021.relationLabels[person.relation] || person.relation}${ancestorPath(person)}`;
+function activeAttributeBadges(person, pack) {
+  return (pack.meta.personFields || []).flatMap((field) => {
+    if (!field.relations.includes(person.relation)) return [];
+    const value = person.attributes?.[field.key];
+    if (field.type === 'checkbox') return value ? [field.badge || field.label] : [];
+    return value ? [`${field.badge || field.label} ${value}`] : [];
+  });
 }
 
 function renderPeople() {
+  const pack = currentPack();
+  const groups = pack.meta.groups || [];
   elements.peopleList.innerHTML = '';
   elements.emptyPeople.hidden = caseData.people.length > 0;
   elements.peopleList.hidden = caseData.people.length === 0;
-
-  groups.forEach((group) => {
+  const covered = new Set(groups.flatMap((group) => group.relations));
+  const renderGroups = [...groups];
+  if (caseData.people.some((person) => !covered.has(person.relation))) {
+    renderGroups.push({ title: '当前法律包未使用的已录入人物', relations: caseData.people.filter((person) => !covered.has(person.relation)).map((person) => person.relation) });
+  }
+  renderGroups.forEach((group) => {
     const members = caseData.people.filter((person) => group.relations.includes(person.relation));
     if (!members.length) return;
     const section = document.createElement('section');
     section.className = 'group-block';
-    section.innerHTML = `<div class="group-title">${group.title}<span>${members.length}</span></div>`;
-
+    section.innerHTML = `<div class="group-title">${escapeHtml(group.title)}<span>${members.length}</span></div>`;
     members.forEach((person) => {
       const template = document.querySelector('#personCardTemplate').content.cloneNode(true);
       const card = template.querySelector('.person-card');
       const avatar = template.querySelector('.avatar');
       const name = template.querySelector('.person-identity strong');
-      const relationship = template.querySelector('.person-identity span');
+      const relationship = template.querySelector('.person-relation');
+      const badges = template.querySelector('.attribute-badges');
       const status = template.querySelector('.status-select');
       const remove = template.querySelector('.delete-person');
-
       card.dataset.id = person.id;
       card.classList.toggle('muted', person.status !== 'alive');
       avatar.textContent = person.name.trim().slice(0, 1) || '?';
       name.textContent = person.name;
-      relationship.textContent = relationLabel(person);
-      Object.entries(cnMainland2021.statusLabels).forEach(([value, label]) => {
+      relationship.textContent = `${pack.relationLabels[person.relation] || person.relation}${ancestorPath(person)}`;
+      badges.innerHTML = activeAttributeBadges(person, pack).map((badge) => `<b>${escapeHtml(badge)}</b>`).join('');
+      Object.entries(pack.statusLabels).forEach(([value, label]) => {
         const option = document.createElement('option');
-        option.value = value;
-        option.textContent = label;
-        option.selected = person.status === value;
+        option.value = value; option.textContent = label; option.selected = person.status === value;
         status.append(option);
       });
       status.setAttribute('aria-label', `${person.name}的状态`);
-      status.addEventListener('change', () => {
-        person.status = status.value;
-        commit();
-      });
+      status.addEventListener('change', () => { person.status = status.value; commit(); });
       remove.addEventListener('click', () => removePerson(person));
       section.append(template);
     });
@@ -676,12 +2608,9 @@ function renderPeople() {
 
 function removePerson(person) {
   const dependents = new Set();
-  const findDependents = (id) => {
-    caseData.people.filter((item) => item.parentId === id).forEach((item) => {
-      dependents.add(item.id);
-      findDependents(item.id);
-    });
-  };
+  const findDependents = (id) => caseData.people.filter((item) => item.parentId === id).forEach((item) => {
+    dependents.add(item.id); findDependents(item.id);
+  });
   findDependents(person.id);
   const suffix = dependents.size ? `以及其支系中的 ${dependents.size} 位人物` : '';
   if (!window.confirm(`从情景中删除“${person.name}”${suffix}？`)) return;
@@ -689,74 +2618,45 @@ function removePerson(person) {
   commit();
 }
 
-function renderResults() {
-  const lawPack = lawPacks[caseData.lawPackId] || cnMainland2021;
-  const result = calculateInheritance(caseData, lawPack);
-  elements.resultSubtitle.textContent = result.order ? `适用第${result.order === 1 ? '一' : '二'}顺序` : '未形成可分配结果';
+function renderEstateBreakdown(result) {
+  if (caseData.estateMode !== 'detailed') return '<span>省略模式 · 单一净遗产</span>';
+  const pools = result.estateBreakdown.pools;
+  return `<span>动产 ${formatMoney(pools.personalty)}</span><span>不动产 ${formatMoney(pools.immovable)}</span><span>其中死者共同财产份额 ${formatMoney(pools.community)}</span>`;
+}
 
+function renderResults() {
+  const pack = currentPack();
+  const result = calculateInheritance(caseData, pack);
+  elements.resultSubtitle.textContent = result.orderLabel || (result.order ? `适用第 ${result.order} 类` : '未形成可分配结果');
+  const interests = (result.specialInterests || []).map((interest) => `
+    <article class="interest-row"><div><strong>${escapeHtml(interest.name)}</strong><span>${escapeHtml(interest.label)}</span></div><b>权益标的 ${formatMoney(interest.amount)}</b></article>`).join('');
   if (!result.heirs.length) {
+    const emptyTitle = result.estate <= 0
+      ? '请先输入遗产金额'
+      : caseData.people.length ? '当前没有可参与分配的人物' : '先添加候选继承人';
     elements.results.innerHTML = `
-      <div class="no-results">
-        <strong>${caseData.people.length ? '当前没有可参与分配的人物' : '先添加候选继承人'}</strong>
-        <p>${result.warnings[0] || '录入关系与状态后，这里会即时显示继承顺位、份额与金额。'}</p>
-      </div>
-      ${renderBasis(result)}
-    `;
+      <div class="result-hero"><span>可供分配的净遗产</span><strong>${formatMoney(result.estate)}</strong><div class="estate-breakdown">${renderEstateBreakdown(result)}</div></div>
+      <div class="no-results"><strong>${emptyTitle}</strong><p>${result.warnings[0] || '录入关系与状态后，这里会即时显示继承分类、份额与金额。'}</p></div>
+      ${interests ? `<div class="interest-list">${interests}</div>` : ''}${renderBasis(result)}`;
     return;
   }
-
   const heirs = result.heirs.map((heir, index) => {
-    const percentage = heir.share.n / heir.share.d * 100;
+    const percentage = result.estate ? heir.amount / result.estate * 100 : 0;
     const routeText = heir.route === 'representation'
-      ? `代位继承 · 代 ${escapeHtml(heir.representedName)}`
-      : `法定继承 · ${cnMainland2021.relationLabels[heir.relation]}`;
-    return `
-      <article class="heir-row">
-        <div class="heir-top">
-          <div class="heir-name"><span class="rank">${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(heir.name)}</strong></div>
-          <span class="amount">${formatMoney(heir.amount)}</span>
-        </div>
-        <div class="heir-meta">
-          <span class="route-badge ${heir.route}">${routeText}</span>
-          <span>${formatFraction(heir.share)} · ${plainNumber.format(percentage)}%</span>
-        </div>
-      </article>`;
+      ? `代位／代表 · 代 ${escapeHtml(heir.representedName || '所属支系')}`
+      : `法定继承 · ${escapeHtml(pack.relationLabels[heir.relation] || heir.relation)}`;
+    const shareText = heir.shareLabel || (pack.calculate ? `${plainNumber.format(percentage)}%` : `${formatFraction(heir.share)} · ${plainNumber.format(percentage)}%`);
+    const breakdown = heir.breakdown?.length ? `<small>${heir.breakdown.map(escapeHtml).join(' ＋ ')}</small>` : '';
+    return `<article class="heir-row"><div class="heir-top"><div class="heir-name"><span class="rank">${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(heir.name)}</strong></div><span class="amount">${formatMoney(heir.amount)}</span></div><div class="heir-meta"><span class="route-badge ${heir.route}">${routeText}</span><span>${shareText}</span></div>${breakdown}</article>`;
   }).join('');
-
   elements.results.innerHTML = `
-    <div>
-      <div class="result-hero">
-        <span>可供分配的净遗产</span>
-        <strong>${formatMoney(result.estate)}</strong>
-        <p>第${result.order === 1 ? '一' : '二'}顺序 · ${result.branches.length} 个继承支系参与一般均分</p>
-      </div>
-      <div class="heir-list">${heirs}</div>
-    </div>
-    ${renderBasis(result)}
-  `;
+    <div><div class="result-hero"><span>可供分配的净遗产</span><strong>${formatMoney(result.estate)}</strong><p>${escapeHtml(result.summary || result.orderLabel || '按当前法律包计算')}</p><div class="estate-breakdown">${renderEstateBreakdown(result)}</div></div><div class="heir-list">${heirs}</div>${interests ? `<div class="interest-list"><h4>另列的终身／使用权益</h4>${interests}</div>` : ''}</div>${renderBasis(result)}`;
 }
 
 function renderBasis(result) {
-  const items = result.basis.map((item) => `
-    <div class="basis-item">
-      <strong><span>${escapeHtml(item.article)}</span>${escapeHtml(item.title)}</strong>
-      <p>${escapeHtml(item.text)}</p>
-    </div>`).join('');
-  const warnings = result.warnings.map((warning) => `<div class="warning">${escapeHtml(warning)}</div>`).join('');
+  const items = (result.basis || []).map((item) => `<div class="basis-item"><strong><span>${escapeHtml(item.article)}</span>${escapeHtml(item.title)}</strong><p>${escapeHtml(item.text)}</p></div>`).join('');
+  const warnings = (result.warnings || []).map((warning) => `<div class="warning">${escapeHtml(warning)}</div>`).join('');
   return `<div class="basis-box"><h4>计算逻辑</h4>${items}${warnings}</div>`;
-}
-
-function render() {
-  elements.decedentName.value = caseData.decedent.name;
-  elements.estateAmount.value = caseData.decedent.estate ? plainNumber.format(caseData.decedent.estate) : '';
-  elements.currencySelect.value = caseData.currency || 'CNY';
-  const currencySymbol = currencies[caseData.currency]?.symbol || '¥';
-  elements.estateCurrencySymbol.textContent = currencySymbol;
-  elements.solverCurrencySymbol.textContent = currencySymbol;
-  elements.scenarioTitle.textContent = caseData.decedent.name ? `${caseData.decedent.name}的继承情景` : '未命名情景';
-  renderPeople();
-  renderResults();
-  renderSolver();
 }
 
 function renderSolver() {
@@ -771,245 +2671,154 @@ function renderSolver() {
   if (!solverSolutions.length && !elements.solverResults.dataset.message) elements.solverResults.innerHTML = '';
 }
 
+function render() {
+  const pack = currentPack();
+  elements.decedentName.value = caseData.decedent.name;
+  elements.decedentSex.value = caseData.decedent.sex;
+  elements.currencySelect.innerHTML = Object.entries(currencies).map(([code, currency]) => `<option value="${code}">${currency.symbol} ${currency.label}</option>`).join('');
+  elements.detailedCurrencySelect.innerHTML = elements.currencySelect.innerHTML;
+  elements.currencySelect.value = caseData.currency;
+  elements.detailedCurrencySelect.value = caseData.currency;
+  const currencySymbol = currencies[caseData.currency]?.symbol || '¥';
+  elements.estateCurrencySymbol.textContent = currencySymbol;
+  elements.solverCurrencySymbol.textContent = currencySymbol;
+  elements.scenarioTitle.textContent = caseData.decedent.name ? `${caseData.decedent.name}的继承情景` : '未命名情景';
+  renderLawControls(); renderEstateEditor(); renderPeople(); renderResults(); renderSolver();
+  if (elements.kinshipDialog.open) renderKinship();
+  document.documentElement.dataset.lawCountry = pack.meta.country;
+}
+
 function runSolver() {
   const targetId = elements.solverTarget.value;
   const goal = parseAmount(elements.solverAmount.value);
-  const lawPack = lawPacks[caseData.lawPackId] || cnMainland2021;
-  const outcome = solveForTarget(caseData, lawPack, targetId, goal);
+  const outcome = solveForTarget(caseData, currentPack(), targetId, goal);
   solverSolutions = outcome.solutions;
   elements.solverResults.dataset.message = 'true';
-
-  if (outcome.error) {
-    elements.solverResults.innerHTML = `<p class="solver-message">${escapeHtml(outcome.error)}</p>`;
-    return;
-  }
-  if (outcome.reached) {
-    elements.solverResults.innerHTML = `<p class="solver-message success">当前情景已经达到目标：${formatMoney(outcome.currentAmount)}</p>`;
-    return;
-  }
-  if (!outcome.solutions.length) {
-    const best = formatMoney(outcome.bestAmount || outcome.currentAmount);
-    elements.solverResults.innerHTML = `<p class="solver-message">未找到达到目标的组合。已计算范围内最高为 ${best}。</p>`;
-    return;
-  }
-
-  elements.solverResults.innerHTML = `
-    <div class="solver-summary">当前 ${formatMoney(outcome.currentAmount)} · 找到 ${outcome.solutions.length} 个最少改动方案</div>
-    ${outcome.solutions.map((solution, index) => `
-      <article class="solution-card">
-        <div class="solution-top"><strong>方案 ${index + 1}</strong><span>${formatMoney(solution.amount)}</span></div>
-        <ul>${solution.changes.map((change) => `<li>${escapeHtml(change.name)}：生存 → 先于被继承人死亡</li>`).join('')}</ul>
-        <button class="apply-solution" type="button" data-solution="${index}">应用此情景</button>
-      </article>
-    `).join('')}
-  `;
+  if (outcome.error) elements.solverResults.innerHTML = `<p class="solver-message">${escapeHtml(outcome.error)}</p>`;
+  else if (outcome.reached) elements.solverResults.innerHTML = `<p class="solver-message success">当前情景已经达到目标：${formatMoney(outcome.currentAmount)}</p>`;
+  else if (!outcome.solutions.length) elements.solverResults.innerHTML = `<p class="solver-message">未找到达到目标的组合。已计算范围内最高为 ${formatMoney(outcome.bestAmount || outcome.currentAmount)}。</p>`;
+  else elements.solverResults.innerHTML = `<div class="solver-summary">当前 ${formatMoney(outcome.currentAmount)} · 找到 ${outcome.solutions.length} 个最少改动方案</div>${outcome.solutions.map((solution, index) => `<article class="solution-card"><div class="solution-top"><strong>方案 ${index + 1}</strong><span>${formatMoney(solution.amount)}</span></div><ul>${solution.changes.map((change) => `<li>${escapeHtml(change.name)}：生存 → 先于被继承人死亡</li>`).join('')}</ul><button class="apply-solution" type="button" data-solution="${index}">应用此情景</button></article>`).join('')}`;
 }
 
 function applySolution(index) {
   const solution = solverSolutions[index];
   if (!solution) return;
   const changedIds = new Set(solution.changes.map((change) => change.personId));
-  caseData.people.forEach((person) => {
-    if (changedIds.has(person.id)) person.status = 'predeceased';
-  });
+  caseData.people.forEach((person) => { if (changedIds.has(person.id)) person.status = 'predeceased'; });
   elements.solverResults.removeAttribute('data-message');
   commit();
 }
 
+function parentConfiguration(relation) {
+  if (relation === 'descendant') return { relations: ['child', 'descendant'], label: '通过哪位子女／晚辈建立支系', help: '可以连续建立多代子女支系。' };
+  if (relation === 'sibling_child') return { relations: ['sibling', 'sibling_child'], label: '通过哪位兄弟姐妹建立支系', help: '是否允许多代代表／代袭由当前法律包决定。' };
+  if (relation === 'uncle_aunt_child') return { relations: ['uncle_aunt', 'uncle_aunt_child'], label: '通过哪位伯叔姑舅姨建立支系', help: '较远旁系只在部分法域进入顺位。' };
+  return null;
+}
+
 function updateParentOptions() {
+  const pack = currentPack();
   const relation = elements.personRelation.value;
-  const needsParent = relation === 'descendant' || relation === 'sibling_child';
-  elements.parentField.hidden = !needsParent;
-  elements.personParent.required = needsParent;
-  if (!needsParent) return;
-
-  const candidates = relation === 'sibling_child'
-    ? caseData.people.filter((person) => person.relation === 'sibling')
-    : caseData.people.filter((person) => person.relation === 'child' || person.relation === 'descendant');
+  const config = parentConfiguration(relation);
+  elements.parentField.hidden = !config;
+  elements.personParent.required = !!config;
+  if (!config) return;
+  document.querySelector('#parentFieldLabel').textContent = config.label;
+  elements.parentHelp.textContent = config.help;
+  const candidates = caseData.people.filter((person) => config.relations.includes(person.relation));
   elements.personParent.innerHTML = candidates.length
-    ? candidates.map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)} · ${escapeHtml(cnMainland2021.relationLabels[person.relation])}</option>`).join('')
-    : '<option value="">请先录入对应的子女或兄弟姐妹</option>';
+    ? candidates.map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)} · ${escapeHtml(pack.relationLabels[person.relation])}</option>`).join('')
+    : '<option value="">请先录入对应的上级人物</option>';
 }
 
-const kinshipLabels = {
-  father: '父亲', mother: '母亲', husband: '丈夫', wife: '妻子',
-  older_brother: '哥哥', younger_brother: '弟弟', older_sister: '姐姐', younger_sister: '妹妹',
-  son: '儿子', daughter: '女儿'
-};
-const kinshipNames = {
-  father: '父亲', mother: '母亲', husband: '丈夫', wife: '妻子',
-  older_brother: '哥哥', younger_brother: '弟弟', older_sister: '姐姐', younger_sister: '妹妹', son: '儿子', daughter: '女儿',
-  'father.father': '祖父／爷爷', 'father.mother': '祖母／奶奶',
-  'mother.father': '外祖父／外公', 'mother.mother': '外祖母／外婆',
-  'father.older_brother': '伯父', 'father.younger_brother': '叔父',
-  'father.older_sister': '姑母／姑妈', 'father.younger_sister': '姑母／姑妈',
-  'mother.older_brother': '舅舅', 'mother.younger_brother': '舅舅',
-  'mother.older_sister': '姨母／姨妈', 'mother.younger_sister': '姨母／姨妈',
-  'mother.husband': '母亲的丈夫', 'father.wife': '父亲的妻子',
-  'father.son': '父亲的儿子', 'father.daughter': '父亲的女儿',
-  'mother.son': '母亲的儿子', 'mother.daughter': '母亲的女儿',
-  'son.father': '儿子的父亲', 'son.mother': '儿子的母亲',
-  'daughter.father': '女儿的父亲', 'daughter.mother': '女儿的母亲',
-  'husband.son': '丈夫的儿子', 'husband.daughter': '丈夫的女儿',
-  'wife.son': '妻子的儿子', 'wife.daughter': '妻子的女儿',
-  'husband.father': '公公', 'husband.mother': '婆婆', 'wife.father': '岳父', 'wife.mother': '岳母',
-  'older_brother.son': '侄子', 'younger_brother.son': '侄子',
-  'older_brother.daughter': '侄女', 'younger_brother.daughter': '侄女',
-  'older_sister.son': '外甥', 'younger_sister.son': '外甥',
-  'older_sister.daughter': '外甥女', 'younger_sister.daughter': '外甥女',
-  'son.son': '孙子', 'son.daughter': '孙女', 'daughter.son': '外孙', 'daughter.daughter': '外孙女',
-  'father.older_brother.son': '堂兄弟', 'father.younger_brother.son': '堂兄弟',
-  'father.older_brother.daughter': '堂姐妹', 'father.younger_brother.daughter': '堂姐妹',
-  'father.older_sister.son': '表兄弟', 'father.younger_sister.son': '表兄弟',
-  'mother.older_brother.son': '表兄弟', 'mother.younger_brother.son': '表兄弟',
-  'mother.older_sister.son': '表兄弟', 'mother.younger_sister.son': '表兄弟',
-  'father.older_sister.daughter': '表姐妹', 'father.younger_sister.daughter': '表姐妹',
-  'mother.older_brother.daughter': '表姐妹', 'mother.younger_brother.daughter': '表姐妹',
-  'mother.older_sister.daughter': '表姐妹', 'mother.younger_sister.daughter': '表姐妹'
-};
-let kinshipChain = [];
-
-function kinshipCategoryFor(chain) {
-  const key = chain.join('.');
-  const parentRelations = ['father', 'mother'];
-  const childRelations = ['son', 'daughter'];
-  const siblingRelations = ['older_brother', 'younger_brother', 'older_sister', 'younger_sister'];
-  if (!key) return { category: '被继承人' };
-  if (['father', 'mother'].includes(key)) return {
-    category: '父母｜第一顺序',
-    note: '包括生父母、养父母和有扶养关系的继父母'
-  };
-  if (['husband', 'wife'].includes(key)) return { category: '配偶｜第一顺序' };
-  if (['son', 'daughter'].includes(key)) return {
-    category: '子女｜第一顺序',
-    note: '包括婚生、非婚生、养子女和有扶养关系的继子女'
-  };
-  if (['older_brother', 'younger_brother', 'older_sister', 'younger_sister'].includes(key)) return {
-    category: '兄弟姐妹｜第二顺序',
-    note: '包括同父母、同父异母或同母异父、养兄弟姐妹和有扶养关系的继兄弟姐妹'
-  };
-  if (['father.father', 'father.mother'].includes(key)) return { category: '祖父母｜第二顺序' };
-  if (['mother.father', 'mother.mother'].includes(key)) return { category: '外祖父母｜第二顺序' };
-
-  if (chain.length === 2 && parentRelations.includes(chain[0]) && childRelations.includes(chain[1])) {
-    const siblingTitle = chain[1] === 'son' ? '兄弟' : '姐妹';
-    return { cases: [
-      { condition: '该子女就是死者本人', category: '被继承人' },
-      {
-        condition: '该子女不是死者本人，且属于同父母、同父异母／同母异父、养兄弟姐妹或有扶养关系的继兄弟姐妹',
-        category: `${siblingTitle}｜兄弟姐妹·第二顺序`
-      },
-      { condition: '不属于上述关系', category: '无对应分类' }
-    ] };
-  }
-  if (chain.length === 3 && parentRelations.includes(chain[0]) && childRelations.includes(chain[1]) && childRelations.includes(chain[2])) {
-    const childTitle = chain[2] === 'son' ? '儿子' : '女儿';
-    return { cases: [
-      { condition: '中间人物就是死者本人', category: `${childTitle}｜子女·第一顺序` },
-      { condition: '中间人物是死者的兄弟姐妹', category: `${childTitle}｜兄弟姐妹的子女·代位关系` },
-      { condition: '中间人物与死者无对应继承关系', category: '无对应分类' }
-    ] };
-  }
-  if (chain.length === 2 && childRelations.includes(chain[0]) && parentRelations.includes(chain[1])) {
-    const parentTitle = chain[1] === 'father' ? '父亲' : '母亲';
-    return { cases: [
-      { condition: `该${parentTitle}就是死者本人`, category: '被继承人' },
-      { condition: `该${parentTitle}是子女的另一位父母，且与死者是配偶`, category: '配偶｜第一顺序' },
-      { condition: '不属于上述关系', category: '无对应分类' }
-    ] };
-  }
-  if (chain.length === 2 && siblingRelations.includes(chain[0]) && parentRelations.includes(chain[1])) {
-    const parentTitle = chain[1] === 'father' ? '父亲' : '母亲';
-    return { cases: [
-      { condition: `该${parentTitle}也是死者的父母`, category: '父母｜第一顺序' },
-      { condition: `该${parentTitle}只与这位兄弟姐妹存在亲子关系`, category: '无对应分类' }
-    ] };
-  }
-  if (chain.length === 2 && siblingRelations.includes(chain[0]) && siblingRelations.includes(chain[1])) {
-    const siblingTitle = ['older_brother', 'younger_brother'].includes(chain[1]) ? '兄弟' : '姐妹';
-    return { cases: [
-      { condition: '第二步指回死者本人', category: '被继承人' },
-      { condition: '第二步指向另一位符合法定范围的兄弟姐妹', category: `${siblingTitle}｜兄弟姐妹·第二顺序` },
-      { condition: '第二步人物与死者不构成法定兄弟姐妹', category: '无对应分类' }
-    ] };
-  }
-  if (/^(son|daughter)\.(son|daughter)(\.(son|daughter))*$/.test(key)) return { category: '子女的直系晚辈｜代位关系' };
-  if (/^(older_brother|younger_brother|older_sister|younger_sister)\.(son|daughter)$/.test(key)) return { category: '兄弟姐妹的子女｜代位关系' };
-
-  if (key === 'mother.husband') {
-    return { cases: [
-      { condition: '存在拟制血亲关系', category: '父亲｜父母·第一顺序' },
-      { condition: '不存在拟制血亲关系', category: '无对应分类' }
-    ] };
-  }
-  if (key === 'father.wife') {
-    return { cases: [
-      { condition: '存在拟制血亲关系', category: '母亲｜父母·第一顺序' },
-      { condition: '不存在拟制血亲关系', category: '无对应分类' }
-    ] };
-  }
-  if (/^(husband|wife)\.(son|daughter)$/.test(key)) {
-    const childTitle = key.endsWith('.son') ? '儿子' : '女儿';
-    return { cases: [
-      { condition: '存在拟制血亲关系', category: `${childTitle}｜子女·第一顺序` },
-      { condition: '不存在拟制血亲关系', category: '无对应分类' }
-    ] };
-  }
-  if (/^(mother\.husband|father\.wife)\.(son|daughter)$/.test(key)) {
-    const siblingTitle = key.endsWith('.son') ? '兄弟' : '姐妹';
-    return { cases: [
-      {
-        condition: '属于同父异母／同母异父、养兄弟姐妹，或有扶养关系的继兄弟姐妹',
-        category: `${siblingTitle}｜兄弟姐妹·第二顺序`
-      },
-      { condition: '不属于上述关系', category: '无对应分类' }
-    ] };
-  }
-  if (/^(son\.wife|daughter\.husband)$/.test(key)) {
-    return { cases: [
-      { condition: '丧偶且对死者尽了主要赡养义务', category: '第一顺序继承人' },
-      { condition: '不满足上述条件', category: '无对应分类' }
-    ] };
-  }
-  return { category: '当前分类未包含' };
+function renderDynamicPersonFields() {
+  const fields = (currentPack().meta.personFields || []).filter((field) => field.relations.includes(elements.personRelation.value));
+  elements.personDynamicFields.hidden = !fields.length;
+  elements.personDynamicFields.innerHTML = fields.length ? `<p class="dynamic-fields-title">当前法律包需要的身份事实</p>${fields.map((field) => {
+    const help = field.help ? `<small class="dynamic-field-help">${escapeHtml(field.help)}</small>` : '';
+    if (field.type === 'number') return `<div class="dynamic-field-block"><label class="dynamic-number"><span>${escapeHtml(field.label)}</span><input class="text-input" type="number" min="${field.min || 1}" step="1" data-person-attribute="${field.key}" placeholder="例如 1" /></label>${help}</div>`;
+    return `<div class="dynamic-field-block"><label class="check-field"><input type="checkbox" data-person-attribute="${field.key}" /><span>${escapeHtml(field.label)}</span></label>${help}</div>`;
+  }).join('')}` : '';
 }
 
-function renderKinshipCategory(classification) {
-  const label = document.querySelector('#kinshipCategoryLabel');
-  label.textContent = classification.cases ? '分类讨论' : '人物分类';
-  elements.kinshipCategory.innerHTML = '';
-  if (!classification.cases) {
-    elements.kinshipCategory.textContent = classification.category;
-    if (classification.note) {
-      const note = document.createElement('small');
-      note.className = 'kinship-category-note';
-      note.textContent = classification.note;
-      elements.kinshipCategory.append(note);
-    }
+function updatePersonDialogFields() { updateParentOptions(); renderDynamicPersonFields(); }
+
+function openPersonDialog() {
+  const pack = currentPack();
+  elements.personForm.reset();
+  elements.personName.setCustomValidity('');
+  elements.personRelation.innerHTML = pack.meta.relations.map((relation) => `<option value="${relation}">${escapeHtml(pack.relationLabels[relation] || relation)}</option>`).join('');
+  elements.personStatus.innerHTML = Object.entries(pack.statusLabels).map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('');
+  updatePersonDialogFields();
+  if (typeof elements.personDialog.showModal === 'function') elements.personDialog.showModal();
+  else elements.personDialog.setAttribute('open', '');
+  requestAnimationFrame(() => elements.personName.focus());
+}
+
+function closePersonDialog() {
+  if (typeof elements.personDialog.close === 'function') elements.personDialog.close();
+  else elements.personDialog.removeAttribute('open');
+}
+
+function addPerson(event) {
+  event.preventDefault();
+  if (!elements.personForm.reportValidity()) return;
+  const personName = elements.personName.value.trim();
+  if (!personName) {
+    elements.personName.setCustomValidity('请输入姓名');
+    elements.personName.reportValidity();
+    elements.personName.addEventListener('input', () => elements.personName.setCustomValidity(''), { once: true });
     return;
   }
-  classification.cases.forEach((item) => {
-    const row = document.createElement('div');
-    row.className = 'kinship-case';
-    const condition = document.createElement('span');
-    condition.textContent = item.condition;
-    const category = document.createElement('b');
-    category.textContent = item.category;
-    row.append(condition, category);
-    elements.kinshipCategory.append(row);
+  const nameConflict = findPersonNameConflict(caseData.people, personName);
+  if (nameConflict) {
+    elements.personName.setCustomValidity(`姓名“${nameConflict.name}”已存在。`);
+    elements.personName.reportValidity();
+    elements.personName.addEventListener('input', () => elements.personName.setCustomValidity(''), { once: true });
+    return;
+  }
+  const relation = elements.personRelation.value;
+  const parentConfig = parentConfiguration(relation);
+  if (parentConfig && !elements.personParent.value) {
+    elements.personParent.setCustomValidity('请先录入并选择支系人物');
+    elements.personParent.reportValidity(); elements.personParent.setCustomValidity(''); return;
+  }
+  const attributes = {};
+  elements.personDynamicFields.querySelectorAll('[data-person-attribute]').forEach((input) => {
+    attributes[input.dataset.personAttribute] = input.type === 'checkbox' ? input.checked : (input.value ? Number(input.value) : null);
   });
+  const candidate = {
+    id: makeId(), name: personName, relation, status: elements.personStatus.value,
+    attributes, ...(parentConfig ? { parentId: elements.personParent.value } : {})
+  };
+  const orderConflict = findBirthOrderConflict(caseData.people, candidate);
+  if (orderConflict) {
+    const orderInput = elements.personDynamicFields.querySelector('[data-person-attribute="birthOrder"]');
+    orderInput.setCustomValidity(`排行 ${attributes.birthOrder} 已用于“${orderConflict.name}”；不同性别合并排序。`);
+    orderInput.reportValidity();
+    orderInput.addEventListener('input', () => orderInput.setCustomValidity(''), { once: true });
+    return;
+  }
+  caseData.people.push(candidate);
+  closePersonDialog(); commit();
 }
 
 function renderKinship() {
-  elements.kinshipPath.textContent = ['死者', ...kinshipChain.map((key) => kinshipLabels[key])].join(' → ');
-  const key = kinshipChain.join('.');
-  elements.kinshipResult.textContent = kinshipNames[key] || (kinshipChain.length ? `${kinshipChain.map((item) => kinshipLabels[item]).join('的')}（关系链）` : '死者本人');
-  renderKinshipCategory(kinshipCategoryFor(kinshipChain));
+  const view = getKinshipView(currentPack(), kinshipChain);
+  elements.kinshipLaw.textContent = currentPack().meta.menuLabel;
+  elements.kinshipButtons.innerHTML = kinshipKeys.map((key) => `<button type="button" data-kinship="${key}">${escapeHtml(view.labels[key])}</button>`).join('');
+  elements.kinshipPath.textContent = ['死者', ...kinshipChain.map((key) => view.labels[key])].join(' → ');
+  elements.kinshipResult.textContent = view.name;
+  elements.kinshipCategory.innerHTML = '';
+  elements.kinshipCategory.textContent = view.classification.category;
+  if (view.classification.note) {
+    const note = document.createElement('small'); note.className = 'kinship-category-note'; note.textContent = view.classification.note;
+    elements.kinshipCategory.append(note);
+  }
 }
 
 function openKinshipDialog() {
-  kinshipChain = [];
-  renderKinship();
+  kinshipChain = []; renderKinship();
   if (typeof elements.kinshipDialog.showModal === 'function') elements.kinshipDialog.showModal();
   else elements.kinshipDialog.setAttribute('open', '');
 }
@@ -1022,35 +2831,18 @@ function closeKinshipDialog() {
 function renderStormEditor() {
   const usedIds = new Set(stormEvents.map((event) => event.personId));
   const candidates = caseData.people.filter((person) => person.status === 'alive' && !usedIds.has(person.id));
-  elements.stormPerson.innerHTML = candidates.length
-    ? candidates.map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)}</option>`).join('')
-    : '<option value="">没有可添加的人物</option>';
-  elements.stormPerson.disabled = !candidates.length;
-  elements.addStormEvent.disabled = !candidates.length;
-  elements.analyzeStorm.disabled = !stormEvents.length;
-
-  elements.stormSequence.innerHTML = stormEvents.length
-    ? stormEvents.map((event, index) => {
-        const person = caseData.people.find((candidate) => candidate.id === event.personId);
-        return `<article class="storm-event-row">
-          <span class="storm-event-number">${index + 1}</span>
-          <div class="storm-event-copy"><strong>${escapeHtml(person?.name || '未知人物')}</strong><span>${stormEventLabels[event.type]}</span></div>
-          <div class="storm-event-actions">
-            <button type="button" data-storm-action="up" data-index="${index}" aria-label="上移" ${index === 0 ? 'disabled' : ''}>↑</button>
-            <button type="button" data-storm-action="down" data-index="${index}" aria-label="下移" ${index === stormEvents.length - 1 ? 'disabled' : ''}>↓</button>
-            <button type="button" data-storm-action="remove" data-index="${index}" aria-label="删除">×</button>
-          </div>
-        </article>`;
-      }).join('')
-    : '<div class="storm-sequence-empty">尚未添加事件</div>';
+  elements.stormPerson.innerHTML = candidates.length ? candidates.map((person) => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)}</option>`).join('') : '<option value="">没有可添加的人物</option>';
+  elements.stormPerson.disabled = !candidates.length; elements.addStormEvent.disabled = !candidates.length; elements.analyzeStorm.disabled = !stormEvents.length;
+  elements.stormSequence.innerHTML = stormEvents.length ? stormEvents.map((event, index) => {
+    const person = caseData.people.find((candidate) => candidate.id === event.personId);
+    return `<article class="storm-event-row"><span class="storm-event-number">${index + 1}</span><div class="storm-event-copy"><strong>${escapeHtml(person?.name || '未知人物')}</strong><span>${stormEventLabels[event.type]}</span></div><div class="storm-event-actions"><button type="button" data-storm-action="up" data-index="${index}" aria-label="上移" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-storm-action="down" data-index="${index}" aria-label="下移" ${index === stormEvents.length - 1 ? 'disabled' : ''}>↓</button><button type="button" data-storm-action="remove" data-index="${index}" aria-label="删除">×</button></div></article>`;
+  }).join('') : '<div class="storm-sequence-empty">尚未添加事件</div>';
 }
 
 function openStormDialog() {
   stormEvents = [];
   elements.stormResults.className = 'storm-results-empty';
-  elements.stormResults.textContent = caseData.people.some((person) => person.status === 'alive')
-    ? '添加事件后开始推测。'
-    : '请先在主界面添加人物。';
+  elements.stormResults.textContent = caseData.people.some((person) => person.status === 'alive') ? '添加事件后开始推测。' : '请先在主界面添加人物。';
   renderStormEditor();
   if (typeof elements.stormDialog.showModal === 'function') elements.stormDialog.showModal();
   else elements.stormDialog.setAttribute('open', '');
@@ -1065,9 +2857,7 @@ function addStormEvent() {
   const personId = elements.stormPerson.value;
   if (!personId || stormEvents.some((event) => event.personId === personId)) return;
   stormEvents.push({ personId, type: elements.stormEventType.value });
-  elements.stormResults.className = 'storm-results-empty';
-  elements.stormResults.textContent = '顺序已修改，点击下方按钮重新推测。';
-  renderStormEditor();
+  elements.stormResults.className = 'storm-results-empty'; elements.stormResults.textContent = '顺序已修改，点击下方按钮重新推测。'; renderStormEditor();
 }
 
 function editStormSequence(action, index) {
@@ -1075,181 +2865,109 @@ function editStormSequence(action, index) {
   if (action === 'remove') stormEvents.splice(index, 1);
   if (action === 'up' && index > 0) [stormEvents[index - 1], stormEvents[index]] = [stormEvents[index], stormEvents[index - 1]];
   if (action === 'down' && index < stormEvents.length - 1) [stormEvents[index + 1], stormEvents[index]] = [stormEvents[index], stormEvents[index + 1]];
-  elements.stormResults.className = 'storm-results-empty';
-  elements.stormResults.textContent = stormEvents.length ? '顺序已修改，点击下方按钮重新推测。' : '添加事件后开始推测。';
-  renderStormEditor();
+  elements.stormResults.className = 'storm-results-empty'; elements.stormResults.textContent = stormEvents.length ? '顺序已修改，点击下方按钮重新推测。' : '添加事件后开始推测。'; renderStormEditor();
 }
 
 function renderStormAnalysis(analysis) {
   if (!analysis.ranking.length) {
-    elements.stormResults.className = 'storm-results-empty';
-    elements.stormResults.textContent = '当前顺序下没有可推测的受益者。';
-    return;
+    elements.stormResults.className = 'storm-results-empty'; elements.stormResults.textContent = '当前顺序下没有可推测的受益者。'; return;
   }
   const winner = analysis.ranking[0];
-  const rankings = analysis.ranking.map((person) => `
-    <div class="storm-rank-item">
-      <div class="storm-rank-head"><strong>${escapeHtml(person.name)}</strong><span>${plainNumber.format(person.probability)}% · 最终 ${formatMoney(person.amount)}</span></div>
-      <div class="storm-rank-bar"><i style="width:${Math.min(100, person.probability)}%"></i></div>
-    </div>`).join('');
+  const rankings = analysis.ranking.map((person) => `<div class="storm-rank-item"><div class="storm-rank-head"><strong>${escapeHtml(person.name)}</strong><span>${plainNumber.format(person.probability)}% · 最终 ${formatMoney(person.amount)}</span></div><div class="storm-rank-bar"><i style="width:${Math.min(100, person.probability)}%"></i></div></div>`).join('');
   const timeline = analysis.timeline.map((step) => {
     const gains = step.changes.filter((change) => change.delta > 0).slice(0, 3);
-    const text = gains.length
-      ? gains.map((change) => `${escapeHtml(change.name)} +${formatMoney(change.delta)}`).join('，')
-      : '没有人物取得正向增益';
+    const text = gains.length ? gains.map((change) => `${escapeHtml(change.name)} +${formatMoney(change.delta)}`).join('，') : '没有人物取得正向增益';
     return `<div class="storm-step"><strong>${step.index}. ${escapeHtml(step.personName)} · ${stormEventLabels[step.event.type]}</strong><p>${text}</p></div>`;
   }).join('');
-
   elements.stormResults.className = '';
-  elements.stormResults.innerHTML = `
-    <div class="storm-winner">
-      <span>最大受益者推测</span>
-      <div class="storm-winner-main"><strong>${escapeHtml(winner.name)}</strong><b>${plainNumber.format(winner.probability)}%</b></div>
-    </div>
-    <div class="storm-ranking">${rankings}</div>
-    <div class="storm-timeline"><h4>顺序中的份额变化</h4>${timeline}</div>
-  `;
-}
-
-function analyzeStorm() {
-  if (!stormEvents.length) return;
-  const lawPack = lawPacks[caseData.lawPackId] || cnMainland2021;
-  renderStormAnalysis(analyzeEventSequence(caseData, lawPack, stormEvents));
-}
-
-function openPersonDialog() {
-  elements.personForm.reset();
-  elements.personRelation.innerHTML = relationOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
-  updateParentOptions();
-  if (typeof elements.personDialog.showModal === 'function') elements.personDialog.showModal();
-  else elements.personDialog.setAttribute('open', '');
-  requestAnimationFrame(() => elements.personName.focus());
-}
-
-function closePersonDialog() {
-  if (typeof elements.personDialog.close === 'function') elements.personDialog.close();
-  else elements.personDialog.removeAttribute('open');
-}
-
-function addPerson(event) {
-  event.preventDefault();
-  if (!elements.personForm.reportValidity()) return;
-  const relation = elements.personRelation.value;
-  const needsParent = relation === 'descendant' || relation === 'sibling_child';
-  if (needsParent && !elements.personParent.value) {
-    elements.personParent.setCustomValidity('请先录入并选择支系人物');
-    elements.personParent.reportValidity();
-    elements.personParent.setCustomValidity('');
-    return;
-  }
-  caseData.people.push({
-    id: makeId(),
-    name: elements.personName.value.trim(),
-    relation,
-    status: elements.personStatus.value,
-    ...(needsParent ? { parentId: elements.personParent.value } : {})
-  });
-  closePersonDialog();
-  commit();
-}
-
-function parseAmount(raw) {
-  return Number(String(raw).replaceAll(',', '').replaceAll('，', '').trim());
+  elements.stormResults.innerHTML = `<div class="storm-winner"><span>最大受益者推测</span><div class="storm-winner-main"><strong>${escapeHtml(winner.name)}</strong><b>${plainNumber.format(winner.probability)}%</b></div></div><div class="storm-ranking">${rankings}</div><div class="storm-timeline"><h4>顺序中的份额变化</h4>${timeline}</div>`;
 }
 
 function exportProject() {
   const blob = new Blob([JSON.stringify(caseData, null, 2)], { type: 'application/json' });
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
+  const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
   const safeName = (caseData.decedent.name || '未命名').replace(/[\\/:*?"<>|]/g, '-');
-  link.download = `遗产继承情景-${safeName}.json`;
-  link.click();
-  URL.revokeObjectURL(link.href);
+  link.download = `遗产继承情景-${safeName}.json`; link.click(); URL.revokeObjectURL(link.href);
 }
 
 async function importProject(file) {
   try {
     const imported = JSON.parse(await file.text());
     if (!imported?.decedent || !Array.isArray(imported?.people)) throw new Error('格式错误');
-    caseData = {
-      ...imported,
-      id: imported.id || makeId(),
-      currency: currencies[imported.currency] ? imported.currency : 'CNY',
-      lawPackId: lawPacks[imported.lawPackId] ? imported.lawPackId : 'cn-mainland-2021'
-    };
-    commit();
-  } catch {
-    window.alert('无法导入：项目文件格式不正确。');
-  } finally {
-    elements.importInput.value = '';
-  }
+    const migrated = migrateCase(imported);
+    const duplicateName = findDuplicatePersonName(migrated.people);
+    if (duplicateName) {
+      window.alert(`无法导入：人物姓名“${duplicateName.duplicate.name}”重复。`);
+      return;
+    }
+    caseData = migrated; commit();
+  } catch { window.alert('无法导入：项目文件格式不正确。'); }
+  finally { elements.importInput.value = ''; }
 }
 
-elements.decedentName.addEventListener('input', () => {
-  caseData.decedent.name = elements.decedentName.value;
-  commit();
-});
-elements.estateAmount.addEventListener('focus', () => {
-  elements.estateAmount.value = caseData.decedent.estate || '';
-});
+function selectLawPack(id) {
+  const pack = lawPackRegistry[id];
+  if (!pack) return;
+  caseData.lawPackId = id; caseData.currency = pack.meta.defaultCurrency; kinshipChain = []; commit();
+}
+
+elements.decedentName.addEventListener('input', () => { caseData.decedent.name = elements.decedentName.value; commit(); });
+elements.decedentSex.addEventListener('change', () => { caseData.decedent.sex = elements.decedentSex.value; commit(); });
+elements.estateAmount.addEventListener('focus', () => { elements.estateAmount.value = caseData.decedent.estate || ''; });
 elements.estateAmount.addEventListener('blur', () => {
-  const amount = parseAmount(elements.estateAmount.value);
-  caseData.decedent.estate = Number.isFinite(amount) && amount >= 0 ? amount : 0;
-  commit();
+  const amount = parseAmount(elements.estateAmount.value); caseData.decedent.estate = Number.isFinite(amount) && amount >= 0 ? amount : 0; commit();
 });
-elements.estateAmount.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') elements.estateAmount.blur();
+elements.estateAmount.addEventListener('keydown', (event) => { if (event.key === 'Enter') elements.estateAmount.blur(); });
+elements.detailedEstateToggle.addEventListener('change', () => { caseData.estateMode = elements.detailedEstateToggle.checked ? 'detailed' : 'simple'; commit(); });
+elements.communitySharePercent.addEventListener('change', () => {
+  const value = Number(elements.communitySharePercent.value); caseData.communitySharePercent = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : 50; commit();
 });
-elements.personRelation.addEventListener('change', updateParentOptions);
-elements.currencySelect.addEventListener('change', () => {
-  caseData.currency = elements.currencySelect.value;
-  commit();
+document.querySelectorAll('[data-asset-key]').forEach((row) => {
+  const key = row.dataset.assetKey; const checkbox = row.querySelector('.asset-enabled'); const input = row.querySelector('.asset-amount');
+  checkbox.addEventListener('change', () => { caseData.assets[key].enabled = checkbox.checked; commit(); });
+  input.addEventListener('focus', () => { input.value = caseData.assets[key].amount || ''; });
+  input.addEventListener('blur', () => {
+    const value = parseAmount(input.value); caseData.assets[key].amount = Number.isFinite(value) && value >= 0 ? value : 0; commit();
+  });
+  input.addEventListener('keydown', (event) => { if (event.key === 'Enter') input.blur(); });
 });
+elements.countrySelect.addEventListener('change', () => {
+  const first = lawPackList.find((pack) => pack.meta.country === elements.countrySelect.value); if (first) selectLawPack(first.meta.id);
+});
+elements.lawPack.addEventListener('change', () => selectLawPack(elements.lawPack.value));
+elements.currencySelect.addEventListener('change', () => { caseData.currency = elements.currencySelect.value; commit(); });
+elements.detailedCurrencySelect.addEventListener('change', () => { caseData.currency = elements.detailedCurrencySelect.value; commit(); });
+elements.personRelation.addEventListener('change', updatePersonDialogFields);
 elements.personForm.addEventListener('submit', addPerson);
 document.querySelector('#addPersonButton').addEventListener('click', openPersonDialog);
 document.querySelector('[data-action="add-person"]').addEventListener('click', openPersonDialog);
 document.querySelectorAll('.dialog-close').forEach((button) => button.addEventListener('click', closePersonDialog));
 document.querySelector('#kinshipButton').addEventListener('click', openKinshipDialog);
 document.querySelectorAll('.kinship-close').forEach((button) => button.addEventListener('click', closeKinshipDialog));
-document.querySelectorAll('[data-kinship]').forEach((button) => button.addEventListener('click', () => {
-  if (kinshipChain.length < 4) kinshipChain.push(button.dataset.kinship);
-  renderKinship();
-}));
-document.querySelector('#kinshipUndo').addEventListener('click', () => {
-  kinshipChain.pop();
-  renderKinship();
+elements.kinshipButtons.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-kinship]');
+  if (button && kinshipChain.length < 4) { kinshipChain.push(button.dataset.kinship); renderKinship(); }
 });
-document.querySelector('#kinshipClear').addEventListener('click', () => {
-  kinshipChain = [];
-  renderKinship();
-});
+document.querySelector('#kinshipUndo').addEventListener('click', () => { kinshipChain.pop(); renderKinship(); });
+document.querySelector('#kinshipClear').addEventListener('click', () => { kinshipChain = []; renderKinship(); });
 document.querySelector('#stormModeButton').addEventListener('click', openStormDialog);
 document.querySelectorAll('.storm-close').forEach((button) => button.addEventListener('click', closeStormDialog));
 elements.addStormEvent.addEventListener('click', addStormEvent);
-elements.analyzeStorm.addEventListener('click', analyzeStorm);
+elements.analyzeStorm.addEventListener('click', () => { if (stormEvents.length) renderStormAnalysis(analyzeEventSequence(caseData, currentPack(), stormEvents)); });
 elements.stormSequence.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-storm-action]');
-  if (button) editStormSequence(button.dataset.stormAction, Number(button.dataset.index));
+  const button = event.target.closest('[data-storm-action]'); if (button) editStormSequence(button.dataset.stormAction, Number(button.dataset.index));
 });
 document.querySelector('#resetButton').addEventListener('click', () => {
   if (!window.confirm('新建空白情景？当前情景会从浏览器本地存储中替换，请先导出需要保留的项目。')) return;
-  caseData = emptyCase();
-  elements.solverAmount.value = '';
-  elements.solverResults.innerHTML = '';
-  commit();
+  caseData = emptyCase(); elements.solverAmount.value = ''; elements.solverResults.innerHTML = ''; commit();
 });
 document.querySelector('#exportButton').addEventListener('click', exportProject);
 document.querySelector('#importButton').addEventListener('click', () => elements.importInput.click());
-elements.importInput.addEventListener('change', () => {
-  if (elements.importInput.files[0]) importProject(elements.importInput.files[0]);
-});
+elements.importInput.addEventListener('change', () => { if (elements.importInput.files[0]) importProject(elements.importInput.files[0]); });
 document.querySelector('#solveButton').addEventListener('click', runSolver);
-elements.solverAmount.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') runSolver();
-});
+elements.solverAmount.addEventListener('keydown', (event) => { if (event.key === 'Enter') runSolver(); });
 elements.solverResults.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-solution]');
-  if (button) applySolution(Number(button.dataset.solution));
+  const button = event.target.closest('[data-solution]'); if (button) applySolution(Number(button.dataset.solution));
 });
 
 render();
